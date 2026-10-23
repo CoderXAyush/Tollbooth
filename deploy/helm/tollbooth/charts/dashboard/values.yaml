@@ -1,0 +1,12 @@
+replicaCount: 1
+image:
+  repository: tollbooth/dashboard
+  tag: dev
+port: 8080
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 200m
+    memory: 128Mi

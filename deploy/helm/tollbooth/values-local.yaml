@@ -1,0 +1,54 @@
+# ─────────────────────────────────────────────────────────────
+# Tollbooth – Local Development Values (kind cluster)
+# ─────────────────────────────────────────────────────────────
+
+global:
+  namespace: tollbooth
+  imagePullPolicy: Never  # use locally-built images loaded into kind
+
+gateway:
+  enabled: true
+  replicaCount: 1
+  image:
+    repository: tollbooth/gateway
+    tag: dev
+
+woo-mcp:
+  enabled: true
+  replicaCount: 1
+  image:
+    repository: tollbooth/woo-mcp
+    tag: dev
+
+dashboard:
+  enabled: true
+  replicaCount: 1
+  image:
+    repository: tollbooth/dashboard
+    tag: dev
+
+postgres:
+  enabled: true
+  storage:
+    size: 1Gi
+    storageClass: standard
+
+store:
+  enabled: true
+  wordpress:
+    storage:
+      size: 1Gi
+      storageClass: standard
+  mariadb:
+    storage:
+      size: 1Gi
+      storageClass: standard
+
+ingress:
+  enabled: true
+  className: nginx
+  hosts:
+    dashboard: dashboard.localtest.me
+    api: api.localtest.me
+    store: store.localtest.me
+  tls: []

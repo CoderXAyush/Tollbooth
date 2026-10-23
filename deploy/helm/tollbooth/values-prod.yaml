@@ -1,0 +1,66 @@
+# ─────────────────────────────────────────────────────────────
+# Tollbooth – Production Values (k3s on VPS)
+# ─────────────────────────────────────────────────────────────
+
+global:
+  namespace: tollbooth
+  imagePullPolicy: Always
+
+gateway:
+  enabled: true
+  replicaCount: 2
+  image:
+    repository: ghcr.io/coderxayush/tollbooth/gateway
+    tag: latest
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 512Mi
+
+woo-mcp:
+  enabled: true
+  replicaCount: 1
+  image:
+    repository: ghcr.io/coderxayush/tollbooth/woo-mcp
+    tag: latest
+
+dashboard:
+  enabled: true
+  replicaCount: 2
+  image:
+    repository: ghcr.io/coderxayush/tollbooth/dashboard
+    tag: latest
+
+postgres:
+  enabled: true
+  storage:
+    size: 10Gi
+    storageClass: local-path
+
+store:
+  enabled: true
+  wordpress:
+    storage:
+      size: 5Gi
+      storageClass: local-path
+  mariadb:
+    storage:
+      size: 10Gi
+      storageClass: local-path
+
+ingress:
+  enabled: true
+  className: nginx
+  hosts:
+    dashboard: dashboard.example.com
+    api: api.example.com
+    store: store.example.com
+  tls:
+    - secretName: tollbooth-tls
+      hosts:
+        - dashboard.example.com
+        - api.example.com
+        - store.example.com

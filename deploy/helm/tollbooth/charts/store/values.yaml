@@ -1,0 +1,31 @@
+wordpress:
+  image:
+    repository: wordpress
+    tag: "6.7-php8.3-apache"
+  port: 80
+  storage:
+    size: 1Gi
+    storageClass: ""
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+mariadb:
+  image:
+    repository: mariadb
+    tag: "11.6"
+  port: 3306
+  storage:
+    size: 1Gi
+    storageClass: ""
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi

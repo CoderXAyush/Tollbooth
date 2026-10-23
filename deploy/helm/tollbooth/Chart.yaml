@@ -1,0 +1,23 @@
+apiVersion: v2
+name: tollbooth
+description: Tollbooth – WooCommerce hosting platform with MCP gateway
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+
+dependencies:
+  - name: gateway
+    version: 0.1.0
+    condition: gateway.enabled
+  - name: woo-mcp
+    version: 0.1.0
+    condition: woo-mcp.enabled
+  - name: dashboard
+    version: 0.1.0
+    condition: dashboard.enabled
+  - name: postgres
+    version: 0.1.0
+    condition: postgres.enabled
+  - name: store
+    version: 0.1.0
+    condition: store.enabled
