@@ -1,0 +1,49 @@
+# ── Go ──────────────────────────────────────────
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+vendor/
+bin/
+dist/
+
+# ── Node / Dashboard ───────────────────────────
+node_modules/
+dashboard/dist/
+dashboard/.vite/
+*.tsbuildinfo
+
+# ── Helm ────────────────────────────────────────
+deploy/helm/**/*.tgz
+charts/*.tgz
+
+# ── Secrets & credentials (NEVER commit) ───────
+.env
+.env.*
+!.env.example
+secrets/
+*.pem
+*.key
+kubeconfig*
+*.kubeconfig
+
+# ── IDE / OS ────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ── Docker ──────────────────────────────────────
+docker-compose.override.yml
+
+# ── Misc ────────────────────────────────────────
+tmp/
+coverage/
+*.cover
+*.prof
