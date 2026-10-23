@@ -81,12 +81,20 @@ docker-woo-mcp:
 docker-dashboard:
 	docker build -t tollbooth/dashboard:dev $(DASH_DIR)
 
+# ── Secrets ─────────────────────────────────────────────────
+.PHONY: secrets
+NAMESPACE ?= tollbooth
+secrets:
+	./deploy/scripts/create-secrets.sh $(NAMESPACE)
+
 # ── Cluster ─────────────────────────────────────────────────
-.PHONY: cluster-up cluster-down
+.PHONY: cluster-up cluster-down test-netpol
 
 cluster-up:
-	$(KIND) create cluster --name $(CLUSTER_NAME) --config $(KIND_CFG)
-	@echo "Cluster $(CLUSTER_NAME) is ready."
+	./deploy/kind/up.sh
 
 cluster-down:
 	$(KIND) delete cluster --name $(CLUSTER_NAME)
+
+test-netpol:
+	./deploy/scripts/test-netpol.sh

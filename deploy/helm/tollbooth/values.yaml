@@ -79,13 +79,16 @@ postgres:
 # ── Store (WordPress + MariaDB) ────────────────────────────
 store:
   enabled: false  # disabled by default, enable per-environment
+  ingress:
+    enabled: false  # umbrella ingress handles routing when enabled under umbrella
+    host: store.127.0.0.1.nip.io
   wordpress:
     image:
       repository: wordpress
-      tag: "6.7-php8.3-apache"
+      tag: "6.7-php8.2-apache"
     port: 80
     storage:
-      size: 1Gi
+      size: 2Gi
       storageClass: ""
     resources:
       requests:
@@ -94,18 +97,34 @@ store:
       limits:
         cpu: 500m
         memory: 512Mi
+    existingSecret: "mariadb-credentials"
+    adminExistingSecret: "wordpress-admin-credentials"
   mariadb:
     image:
       repository: mariadb
-      tag: "11.6"
+      tag: "11.4"
     port: 3306
     storage:
-      size: 1Gi
+      size: 2Gi
       storageClass: ""
     resources:
       requests:
         cpu: 100m
         memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+    existingSecret: "mariadb-credentials"
+  bootstrap:
+    enabled: true
+    image:
+      repository: wordpress
+      tag: "cli"
+    apiKeysExistingSecret: "woocommerce-api-keys"
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
       limits:
         cpu: 500m
         memory: 512Mi
@@ -115,7 +134,7 @@ ingress:
   enabled: true
   className: nginx
   hosts:
-    dashboard: dashboard.localtest.me
-    api: api.localtest.me
-    store: store.localtest.me
+    dashboard: dashboard.127.0.0.1.nip.io
+    api: api.127.0.0.1.nip.io
+    store: store.127.0.0.1.nip.io
   tls: []

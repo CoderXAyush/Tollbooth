@@ -42,6 +42,9 @@ postgres:
 
 store:
   enabled: true
+  ingress:
+    enabled: false
+    host: store.example.com
   wordpress:
     storage:
       size: 5Gi

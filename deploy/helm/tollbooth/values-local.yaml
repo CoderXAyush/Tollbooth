@@ -4,7 +4,7 @@
 
 global:
   namespace: tollbooth
-  imagePullPolicy: Never  # use locally-built images loaded into kind
+  imagePullPolicy: IfNotPresent
 
 gateway:
   enabled: true
@@ -35,20 +35,23 @@ postgres:
 
 store:
   enabled: true
+  ingress:
+    enabled: false
+    host: store.127.0.0.1.nip.io
   wordpress:
     storage:
-      size: 1Gi
+      size: 2Gi
       storageClass: standard
   mariadb:
     storage:
-      size: 1Gi
+      size: 2Gi
       storageClass: standard
 
 ingress:
   enabled: true
   className: nginx
   hosts:
-    dashboard: dashboard.localtest.me
-    api: api.localtest.me
-    store: store.localtest.me
+    dashboard: dashboard.127.0.0.1.nip.io
+    api: api.127.0.0.1.nip.io
+    store: store.127.0.0.1.nip.io
   tls: []

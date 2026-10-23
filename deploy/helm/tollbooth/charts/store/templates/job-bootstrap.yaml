@@ -1,0 +1,269 @@
+{{- if .Values.bootstrap.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Release.Name }}-bootstrap-store
+  labels:
+    app.kubernetes.io/name: wordpress
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: bootstrap
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-delete-policy": before-hook-creation
+    "helm.sh/hook-weight": "10"
+spec:
+  backoffLimit: 5
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: wordpress
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: bootstrap
+    spec:
+      restartPolicy: OnFailure
+      affinity:
+        podAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: wordpress
+                    app.kubernetes.io/instance: {{ .Release.Name }}
+                topologyKey: "kubernetes.io/hostname"
+      containers:
+        - name: bootstrap
+          image: "{{ .Values.bootstrap.image.repository }}:{{ .Values.bootstrap.image.tag }}"
+          imagePullPolicy: {{ if and .Values.global .Values.global.imagePullPolicy }}{{ .Values.global.imagePullPolicy }}{{ else }}{{ .Values.bootstrap.imagePullPolicy }}{{ end }}
+          securityContext:
+            runAsUser: 0
+          env:
+            - name: HOME
+              value: /tmp
+            - name: WORDPRESS_DB_HOST
+              value: "{{ .Release.Name }}-mariadb:{{ .Values.mariadb.port }}"
+            - name: WORDPRESS_DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.wordpress.existingSecret | default "mariadb-credentials" }}
+                  key: MYSQL_USER
+            - name: WORDPRESS_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.wordpress.existingSecret | default "mariadb-credentials" }}
+                  key: MYSQL_PASSWORD
+            - name: WORDPRESS_DB_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.wordpress.existingSecret | default "mariadb-credentials" }}
+                  key: MYSQL_DATABASE
+            - name: ADMIN_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.wordpress.adminExistingSecret | default "wordpress-admin-credentials" }}
+                  key: ADMIN_USER
+            - name: ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.wordpress.adminExistingSecret | default "wordpress-admin-credentials" }}
+                  key: ADMIN_PASSWORD
+            - name: ADMIN_EMAIL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.wordpress.adminExistingSecret | default "wordpress-admin-credentials" }}
+                  key: ADMIN_EMAIL
+            - name: CONSUMER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.bootstrap.apiKeysExistingSecret | default "woocommerce-api-keys" }}
+                  key: CONSUMER_KEY
+            - name: CONSUMER_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.bootstrap.apiKeysExistingSecret | default "woocommerce-api-keys" }}
+                  key: CONSUMER_SECRET
+            - name: WP_URL
+              value: "http://{{ .Values.ingress.host }}"
+          resources:
+            requests:
+              cpu: {{ .Values.bootstrap.resources.requests.cpu }}
+              memory: {{ .Values.bootstrap.resources.requests.memory }}
+            limits:
+              cpu: {{ .Values.bootstrap.resources.limits.cpu }}
+              memory: {{ .Values.bootstrap.resources.limits.memory }}
+          volumeMounts:
+            - name: wp-content
+              mountPath: /var/www/html/wp-content
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+
+              # Wrap wp to always include --allow-root when running in bootstrap job
+              wp() {
+                /usr/local/bin/wp "$@" --allow-root
+              }
+
+              echo "==> [1/7] Waiting for MariaDB at ${WORDPRESS_DB_HOST}..."
+              DB_HOST="${WORDPRESS_DB_HOST%:*}"
+              DB_PORT="${WORDPRESS_DB_HOST#*:}"
+              until mariadb-admin ping -h "${DB_HOST}" -P "${DB_PORT}" -u "${WORDPRESS_DB_USER}" -p"${WORDPRESS_DB_PASSWORD}" --ssl=0 --silent; do
+                echo "    MariaDB not ready yet, sleeping 3s..."
+                sleep 3
+              done
+              echo "    MariaDB is reachable!"
+
+              echo "==> [2/7] Ensuring WordPress core files and wp-config.php..."
+              if [ ! -f /var/www/html/wp-includes/version.php ]; then
+                echo "    Downloading WordPress core files (skipping content)..."
+                wp core download --skip-content --force --path=/var/www/html
+              fi
+
+              if [ ! -f /var/www/html/wp-config.php ]; then
+                echo "    Generating wp-config.php..."
+                wp config create \
+                  --force \
+                  --path=/var/www/html \
+                  --dbname="${WORDPRESS_DB_NAME}" \
+                  --dbuser="${WORDPRESS_DB_USER}" \
+                  --dbpass="${WORDPRESS_DB_PASSWORD}" \
+                  --dbhost="${WORDPRESS_DB_HOST}" \
+                  --extra-php <<'EOF'
+              if (isset($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https') {
+                  $_SERVER['HTTPS'] = 'on';
+              }
+              EOF
+              fi
+
+              echo "==> [3/7] Checking WordPress core installation..."
+              if ! wp core is-installed --path=/var/www/html; then
+                echo "    Running wp core install..."
+                wp core install \
+                  --path=/var/www/html \
+                  --url="${WP_URL}" \
+                  --title="Tollbooth Store" \
+                  --admin_user="${ADMIN_USER}" \
+                  --admin_password="${ADMIN_PASSWORD}" \
+                  --admin_email="${ADMIN_EMAIL}" \
+                  --skip-email
+              else
+                echo "    WordPress core is already installed."
+              fi
+
+              echo "==> [4/7] Updating site URLs and permalinks..."
+              wp option update home "${WP_URL}" --path=/var/www/html
+              wp option update siteurl "${WP_URL}" --path=/var/www/html
+              wp rewrite structure '/%postname%/' --hard --path=/var/www/html
+
+              echo "==> [5/7] Ensuring WooCommerce is installed and activated..."
+              if ! wp plugin is-installed woocommerce --path=/var/www/html; then
+                echo "    Installing WooCommerce plugin..."
+                wp plugin install woocommerce --activate --path=/var/www/html
+              else
+                echo "    WooCommerce is installed; ensuring activated..."
+                wp plugin activate woocommerce --path=/var/www/html || true
+              fi
+
+              echo "==> [6/7] Configuring WooCommerce store settings and pages..."
+              wp option update woocommerce_store_address "123 Market St" --path=/var/www/html
+              wp option update woocommerce_store_city "San Francisco" --path=/var/www/html
+              wp option update woocommerce_default_country "US:CA" --path=/var/www/html
+              wp option update woocommerce_currency "USD" --path=/var/www/html
+              wp option update woocommerce_cod_settings '{"enabled":"yes","title":"Cash on delivery","description":"Pay with cash upon delivery.","instructions":"Pay with cash upon delivery.","enable_for_methods":[],"enable_for_virtual":"yes"}' --format=json --path=/var/www/html
+
+              # Ensure WooCommerce pages exist
+              wp wc --user="${ADMIN_USER}" tool run install_pages --path=/var/www/html || true
+
+              # Seed sample product if none exist
+              PRODUCT_COUNT=$(wp wc product list --user="${ADMIN_USER}" --format=count --path=/var/www/html 2>/dev/null || echo "0")
+              if [ "${PRODUCT_COUNT}" = "0" ] || [ -z "${PRODUCT_COUNT}" ]; then
+                echo "    Seeding sample product (Tollbooth Hoodie)..."
+                wp wc product create \
+                  --user="${ADMIN_USER}" \
+                  --name="Tollbooth Hoodie" \
+                  --type=simple \
+                  --regular_price="49.99" \
+                  --description="Comfortable premium fleece hoodie with Tollbooth logo." \
+                  --short_description="Tollbooth developer merchandise." \
+                  --path=/var/www/html || true
+              else
+                echo "    Products already present in catalog (${PRODUCT_COUNT} found)."
+              fi
+
+              echo "==> [7/7] Seeding WooCommerce REST API credentials..."
+              cat <<'PHPEVAL' > /tmp/seed-api-key.php
+              <?php
+              $user_login = 'shop_manager';
+              $user = get_user_by('login', $user_login);
+              if (!$user) {
+                  $random_password = wp_generate_password(24, true);
+                  $user_id = wp_create_user($user_login, $random_password, 'shop_manager@example.com');
+                  $u = new WP_User($user_id);
+                  $u->set_role('shop_manager');
+                  echo "    Created dedicated user: " . $user_login . " (ID: " . $user_id . ")\n";
+              } else {
+                  $user_id = $user->ID;
+                  echo "    Dedicated user exists: " . $user_login . " (ID: " . $user_id . ")\n";
+              }
+
+              $ck = getenv('CONSUMER_KEY');
+              $cs = getenv('CONSUMER_SECRET');
+
+              if (empty($ck) || empty($cs)) {
+                  echo "    ERROR: Missing CONSUMER_KEY or CONSUMER_SECRET env var\n";
+                  exit(1);
+              }
+
+              global $wpdb;
+              $hashed_ck = wc_api_hash($ck);
+              $truncated = substr($ck, -7);
+
+              $existing = $wpdb->get_row($wpdb->prepare(
+                  "SELECT key_id, consumer_secret FROM {$wpdb->prefix}woocommerce_api_keys WHERE consumer_key = %s",
+                  $hashed_ck
+              ));
+
+              if (!$existing) {
+                  $result = $wpdb->insert(
+                      "{$wpdb->prefix}woocommerce_api_keys",
+                      array(
+                          'user_id'         => $user_id,
+                          'description'     => 'woo-mcp dedicated key',
+                          'permissions'     => 'read_write',
+                          'consumer_key'    => $hashed_ck,
+                          'consumer_secret' => $cs,
+                          'truncated_key'   => $truncated,
+                      ),
+                      array('%d', '%s', '%s', '%s', '%s', '%s')
+                  );
+                  if ($result === false) {
+                      echo "    Failed to insert API key: " . $wpdb->last_error . "\n";
+                      exit(1);
+                  }
+                  echo "    WooCommerce REST API key successfully inserted into wp_woocommerce_api_keys\n";
+              } else {
+                  if ($existing->consumer_secret !== $cs) {
+                      $wpdb->update(
+                          "{$wpdb->prefix}woocommerce_api_keys",
+                          array('consumer_secret' => $cs, 'user_id' => $user_id),
+                          array('key_id' => $existing->key_id)
+                      );
+                      echo "    Updated existing WooCommerce REST API key secret\n";
+                  } else {
+                      echo "    WooCommerce REST API key is already configured and up to date\n";
+                  }
+              }
+              PHPEVAL
+
+              wp eval-file /tmp/seed-api-key.php --path=/var/www/html
+
+              echo "==> Ensuring correct ownership for Apache (www-data)..."
+              chown -R 33:33 /var/www/html/wp-content
+
+              echo "==> Bootstrap hook completed successfully!"
+      volumes:
+        - name: wp-content
+          persistentVolumeClaim:
+            claimName: {{ .Release.Name }}-wp-content
+{{- end }}

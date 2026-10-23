@@ -5,6 +5,7 @@ metadata:
   labels:
     app.kubernetes.io/name: wordpress
     app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: store
 spec:
   type: ClusterIP
   ports:
@@ -14,22 +15,4 @@ spec:
       name: http
   selector:
     app.kubernetes.io/name: wordpress
-    app.kubernetes.io/instance: {{ .Release.Name }}
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: {{ .Release.Name }}-mariadb
-  labels:
-    app.kubernetes.io/name: mariadb
-    app.kubernetes.io/instance: {{ .Release.Name }}
-spec:
-  type: ClusterIP
-  ports:
-    - port: {{ .Values.mariadb.port }}
-      targetPort: mysql
-      protocol: TCP
-      name: mysql
-  selector:
-    app.kubernetes.io/name: mariadb
     app.kubernetes.io/instance: {{ .Release.Name }}

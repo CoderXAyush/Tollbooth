@@ -5,29 +5,13 @@ metadata:
   labels:
     app.kubernetes.io/name: wordpress
     app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: store
 spec:
   accessModes:
     - ReadWriteOnce
   {{- if .Values.wordpress.storage.storageClass }}
-  storageClassName: {{ .Values.wordpress.storage.storageClass }}
+  storageClassName: {{ .Values.wordpress.storage.storageClass | quote }}
   {{- end }}
   resources:
     requests:
       storage: {{ .Values.wordpress.storage.size }}
----
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: {{ .Release.Name }}-mariadb-data
-  labels:
-    app.kubernetes.io/name: mariadb
-    app.kubernetes.io/instance: {{ .Release.Name }}
-spec:
-  accessModes:
-    - ReadWriteOnce
-  {{- if .Values.mariadb.storage.storageClass }}
-  storageClassName: {{ .Values.mariadb.storage.storageClass }}
-  {{- end }}
-  resources:
-    requests:
-      storage: {{ .Values.mariadb.storage.size }}

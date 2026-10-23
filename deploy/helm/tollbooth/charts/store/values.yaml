@@ -1,10 +1,16 @@
+# ─────────────────────────────────────────────────────────────
+# Store Subchart – Default Values (WordPress + MariaDB + Bootstrap)
+# ─────────────────────────────────────────────────────────────
+# This chart can be installed standalone or as part of the Tollbooth umbrella chart.
+
 wordpress:
   image:
     repository: wordpress
-    tag: "6.7-php8.3-apache"
+    tag: "6.7-php8.2-apache"
+  imagePullPolicy: IfNotPresent
   port: 80
   storage:
-    size: 1Gi
+    size: 2Gi
     storageClass: ""
   resources:
     requests:
@@ -13,14 +19,17 @@ wordpress:
     limits:
       cpu: 500m
       memory: 512Mi
+  existingSecret: "mariadb-credentials"
+  adminExistingSecret: "wordpress-admin-credentials"
 
 mariadb:
   image:
     repository: mariadb
-    tag: "11.6"
+    tag: "11.4"
+  imagePullPolicy: IfNotPresent
   port: 3306
   storage:
-    size: 1Gi
+    size: 2Gi
     storageClass: ""
   resources:
     requests:
@@ -29,3 +38,25 @@ mariadb:
     limits:
       cpu: 500m
       memory: 512Mi
+  existingSecret: "mariadb-credentials"
+
+bootstrap:
+  enabled: true
+  image:
+    repository: wordpress
+    tag: "cli"
+  imagePullPolicy: IfNotPresent
+  apiKeysExistingSecret: "woocommerce-api-keys"
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+ingress:
+  enabled: true
+  className: nginx
+  host: "store.127.0.0.1.nip.io"
+  tls: []
