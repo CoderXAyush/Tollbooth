@@ -204,28 +204,93 @@ KEK (in K8s Secret) → encrypts → DEK (in PostgreSQL alongside ciphertext) �
 
 ---
 
-## 7. Local Domain Approach
+## 7. Cluster Bootstrap, Networking and NetworkPolicy
 
-### Local (kind)
+### CNI Selection: KinD kindnet vs. Calico/Cilium
+In KinD v0.25, `kindnetd` implements native Kubernetes `NetworkPolicy` enforcement using kernel packet filtering (nftables/iptables). We opted to use native `kindnet` rather than disabling default CNI to install Calico or Cilium:
+- **Calico/Cilium Overhead:** Installing Calico in local dev KinD containers requires daemonsets (Felix, BIRD, Typha) consuming 500MB+ RAM per node and often causes startup race conditions during container node initialization.
+- **kindnet Stability:** KinD v0.25's kindnet natively enforces Layer 3/4 network policies with near-zero overhead.
+- **Empirical Proof:** Verified via `deploy/scripts/test-netpol.sh`. The test establishes a throwaway namespace with a default-deny ingress policy, confirms traffic from an unauthorized curl pod is actively dropped (exit code 28: connection timeout), applies an ingress allow policy for labeled pods, and confirms immediate HTTP 200 connectivity.
 
-We use `*.localtest.me` which resolves to `127.0.0.1` without any `/etc/hosts` editing:
+### Ingress & Local Domain Approach
+Local ingress uses wildcard DNS `*.127.0.0.1.nip.io` (or `localtest.me`), mapping directly to `127.0.0.1` without local `/etc/hosts` modifications:
+- `dashboard.127.0.0.1.nip.io` → React Dashboard
+- `api.127.0.0.1.nip.io` → Gateway REST API & MCP endpoint
+- `store.127.0.0.1.nip.io` → WordPress Storefront & Admin
 
-- `dashboard.localtest.me` → Dashboard
-- `api.localtest.me` → Gateway
-- `store.localtest.me` → WordPress (for admin access during setup)
+For offline demonstrations, add the following to `/etc/hosts`:
+```
+127.0.0.1 store.127.0.0.1.nip.io dashboard.127.0.0.1.nip.io api.127.0.0.1.nip.io
+```
 
-The kind cluster maps host ports 80/443 to the ingress controller, and Ingress resources route by hostname.
-
-### Production (k3s on VPS)
-
-- Real domains with DNS A records pointing to the VPS IP.
-- cert-manager with Let's Encrypt for TLS.
-- Traefik (k3s default) or NGINX Ingress Controller.
-- Values are swapped via `values-prod.yaml`.
+### Local Image Loading in KinD
+Custom images built on the host (`docker build`) can be loaded directly into KinD nodes using `kind load docker-image <image:tag> --name tollbooth`. All Helm workloads declare `imagePullPolicy: IfNotPresent`, ensuring cached local images are used without network roundtrips, while standard upstream images (`wordpress`, `mariadb`, `postgres`) are pulled automatically if not cached.
 
 ---
 
-## 8. Kubernetes Layout
+## 8. Store Layer Architecture (WordPress + WooCommerce + MariaDB)
+
+### Workload Specifications
+- **MariaDB:** Deployed as a `StatefulSet` with `volumeClaimTemplates` to ensure persistent storage semantics. Uses official `mariadb:11.4` (LTS). Health probes execute `/usr/local/bin/healthcheck.sh --connect --innodb_initialized`.
+- **WordPress:** Deployed as a `Deployment` with a persistent volume claim mounted at `/var/www/html/wp-content`. Uses official `wordpress:6.7-php8.2-apache`. Health probes query `/wp-login.php`.
+- **Ingress Isolation:** Only the WordPress storefront/admin (`store.127.0.0.1.nip.io`) is exposed via Ingress. MariaDB is strictly exposed via a `ClusterIP` service on port 3306, inaccessible from outside the cluster.
+
+### Security Contexts & Privilege Justification
+- **MariaDB:** Runs fully unprivileged with `securityContext`: `runAsNonRoot: true`, `runAsUser: 999`, `fsGroup: 999`.
+- **WordPress:** Runs Apache as root initially because the Linux kernel requires root privileges (`CAP_NET_BIND_SERVICE`) to bind standard HTTP port 80 and initialize log files in `/var/log/apache2`. Once started, Apache immediately drops privileges to the unprivileged `www-data` user (UID 33) for all worker processes handling incoming HTTP requests.
+
+---
+
+## 9. WooCommerce REST API Authentication & Key Storage
+
+### How WooCommerce Hashes and Stores API Keys
+WooCommerce does not store consumer keys in plaintext. Inspecting `includes/wc-core-functions.php` and `includes/class-wc-rest-authentication.php` reveals the exact hashing implementation:
+```php
+function wc_api_hash( $data ) {
+    return hash_hmac( 'sha256', $data, 'wc-api' );
+}
+```
+When an API key is generated:
+1. `consumer_key` is generated (prefixed `ck_...`).
+2. `consumer_secret` is generated (prefixed `cs_...`).
+3. The row is inserted into `wp_woocommerce_api_keys`:
+   - `consumer_key`: The 64-character hex string of `hash_hmac('sha256', $consumer_key, 'wc-api')`.
+   - `consumer_secret`: Stored in plaintext (prefixed `cs_...`).
+   - `truncated_key`: The last 7 characters of `$consumer_key`.
+   - `permissions`: `'read_write'`.
+   - `user_id`: Tied to a dedicated shop-manager user (`shop_manager`).
+
+### In-Cluster HTTP Authentication: The `is_ssl()` Requirement
+In WooCommerce core (`class-wc-rest-authentication.php`):
+```php
+public function authenticate( $user_id ) {
+    if ( ! empty( $user_id ) || ! $this->is_request_to_rest_api() ) {
+        return $user_id;
+    }
+    if ( is_ssl() ) {
+        $user_id = $this->perform_basic_authentication();
+    }
+    if ( $user_id ) {
+        return $user_id;
+    }
+    return $this->perform_oauth_authentication();
+}
+```
+- **The Problem:** Over plain HTTP (such as internal Kubernetes ClusterIP communication `http://store-wordpress:80/wp-json/wc/v3/...`), `is_ssl()` evaluates to `false`. When `is_ssl()` is false, WooCommerce **refuses** to evaluate Basic Authentication headers or query parameters, failing with `401 Unauthorized` (`woocommerce_rest_cannot_view: Sorry, you cannot list resources`) and falling back to OAuth 1.0a signature verification.
+- **The Solution:** Our WordPress deployment sets `WORDPRESS_CONFIG_EXTRA` in `wp-config.php`:
+  ```php
+  if (isset($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https') {
+      $_SERVER['HTTPS'] = 'on';
+  }
+  ```
+- **How woo-mcp Talks to the Store:** When `woo-mcp` calls the WooCommerce REST API, it sends:
+  1. Standard HTTP Basic Auth: `Authorization: Basic base64(consumer_key:consumer_secret)`
+  2. Header: `X-Forwarded-Proto: https`
+  This satisfies `is_ssl()` within WordPress, allowing clean, fast, header-based authentication without OAuth 1.0a signing overhead.
+
+---
+
+## 10. Kubernetes Layout
 
 ### Namespaces
 
