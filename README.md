@@ -8,7 +8,7 @@ A WooCommerce hosting platform with a team MCP (Model Context Protocol) gateway 
 |-------|-------------|--------|
 | 0 | Foundations, contracts, repo scaffold | ✅ Done |
 | 1 | Cluster bootstrap, WordPress + WooCommerce deploy | ✅ Done |
-| 2 | woo-mcp server implementation | 🔲 Not started |
+| 2 | woo-mcp server implementation | ✅ Done |
 | 3 | Gateway MCP aggregator + auth | 🔲 Not started |
 | 4 | Dashboard UI | 🔲 Not started |
 | 5 | Chat agent | 🔲 Not started |
@@ -232,6 +232,114 @@ kubectl run curl-test -n tollbooth --image=curlimages/curl --restart=Never --rm 
 
 ---
 
+## woo-mcp Server & Tools (Chunk 2)
+
+The `woo-mcp` service exposes WooCommerce store operations as Model Context Protocol (MCP) tools over Streamable HTTP (`/mcp`) with Bearer token authentication.
+
+### Deploy woo-mcp
+
+```bash
+# Build Docker image and load into kind
+docker build -t tollbooth/woo-mcp:dev services/woo-mcp
+kind load docker-image tollbooth/woo-mcp:dev --name tollbooth
+
+# Deploy or upgrade woo-mcp subchart
+helm upgrade --install woo-mcp deploy/helm/tollbooth/charts/woo-mcp -n tollbooth
+```
+
+### Run Unit Tests with Race Detection
+
+```bash
+cd services/woo-mcp && go test -race ./...
+```
+
+### Validate NetworkPolicy Isolation
+
+```bash
+# Proves:
+# 1. Gateway-labeled pods CAN reach woo-mcp:8081
+# 2. Unauthorized pods are BLOCKED by NetworkPolicy
+# 3. woo-mcp egress to store-wordpress:80 succeeds
+# 4. Direct MariaDB:3306 access is BLOCKED
+make test-woo-mcp-netpol
+```
+
+### Test MCP Protocol from Gateway Pod
+
+```bash
+# Extract static Bearer auth token
+TOKEN=$(kubectl get secret woo-mcp-auth -n tollbooth -o jsonpath='{.data.MCP_AUTH_TOKEN}' | base64 -d)
+
+# 1. Initialize MCP Session
+kubectl run gateway-curl -n tollbooth --labels="app.kubernetes.io/name=gateway" --image=curlimages/curl --restart=Never --rm -i \
+  --command -- curl -s -X POST \
+  -H "Authorization: Bearer ${TOKEN}" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"gateway-curl","version":"1.0.0"}}}' \
+  http://woo-mcp-woo-mcp:8081/mcp
+
+# 2. List Available Tools
+kubectl run gateway-curl -n tollbooth --labels="app.kubernetes.io/name=gateway" --image=curlimages/curl --restart=Never --rm -i \
+  --command -- curl -s -X POST \
+  -H "Authorization: Bearer ${TOKEN}" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
+  http://woo-mcp-woo-mcp:8081/mcp
+
+# 3. Create a Product ("Test Mug", $12.50)
+kubectl run gateway-curl -n tollbooth --labels="app.kubernetes.io/name=gateway" --image=curlimages/curl --restart=Never --rm -i \
+  --command -- curl -s -X POST \
+  -H "Authorization: Bearer ${TOKEN}" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"create_product","arguments":{"name":"Test Mug","regular_price":"12.50","description":"Ceramic developer mug"}}}' \
+  http://woo-mcp-woo-mcp:8081/mcp
+
+# 4. List Orders Created Today
+kubectl run gateway-curl -n tollbooth --labels="app.kubernetes.io/name=gateway" --image=curlimages/curl --restart=Never --rm -i \
+  --command -- curl -s -X POST \
+  -H "Authorization: Bearer ${TOKEN}" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"list_orders","arguments":{"after":"2026-10-25T00:00:00Z"}}}' \
+  http://woo-mcp-woo-mcp:8081/mcp
+
+# 5. Get Order Details (ID 14)
+kubectl run gateway-curl -n tollbooth --labels="app.kubernetes.io/name=gateway" --image=curlimages/curl --restart=Never --rm -i \
+  --command -- curl -s -X POST \
+  -H "Authorization: Bearer ${TOKEN}" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"get_order","arguments":{"id":14}}}' \
+  http://woo-mcp-woo-mcp:8081/mcp
+
+# 6. Update Order Status
+kubectl run gateway-curl -n tollbooth --labels="app.kubernetes.io/name=gateway" --image=curlimages/curl --restart=Never --rm -i \
+  --command -- curl -s -X POST \
+  -H "Authorization: Bearer ${TOKEN}" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"update_order_status","arguments":{"id":14,"status":"processing"}}}' \
+  http://woo-mcp-woo-mcp:8081/mcp
+```
+
+### Test via MCP Inspector
+
+```bash
+# Forward woo-mcp service to localhost:
+kubectl port-forward svc/woo-mcp-woo-mcp -n tollbooth 8081:8081
+
+# In another terminal, connect with the MCP Inspector:
+npx @modelcontextprotocol/inspector
+# Set transport to Streamable HTTP:
+# URL: http://localhost:8081/mcp
+# Custom Headers: Authorization: Bearer <TOKEN>
+```
+
+---
+
 ## Troubleshooting
 
 1. **MariaDB TLS Negotiation (`TLS/SSL error: self-signed certificate`):**
@@ -248,6 +356,20 @@ kubectl run curl-test -n tollbooth --image=curlimages/curl --restart=Never --rm 
    - *Symptom:* REST API calls over `http://store-wordpress/...` fail with 401 `woocommerce_rest_cannot_view`.
    - *Cause:* WooCommerce disables Basic Authentication unless `is_ssl()` is true.
    - *Fix:* WordPress handles `HTTP_X_FORWARDED_PROTO: https` in `wp-config.php`. Clients pass `-H "X-Forwarded-Proto: https"` to activate Basic Auth over in-cluster HTTP.
+
+4. **woo-mcp 401 Unauthorized:**
+   - *Symptom:* `POST /mcp` returns HTTP 401 with `{"error":"unauthorized: invalid bearer token"}`.
+   - *Cause:* Missing or mismatched Bearer token in the request header.
+   - *Fix:* Verify token from `kubectl get secret woo-mcp-auth -n tollbooth -o jsonpath='{.data.MCP_AUTH_TOKEN}' | base64 -d`.
+
+5. **NetworkPolicy Connection Timeout (exit code 28):**
+   - *Symptom:* Calls to `http://woo-mcp-woo-mcp:8081` hang and time out.
+   - *Cause:* The calling pod does not possess the required label `app.kubernetes.io/name: gateway`.
+   - *Fix:* Apply label `app.kubernetes.io/name: gateway` to client pods communicating with `woo-mcp`.
+
+6. **Store Offline / WooCommerce Unreachable:**
+   - *Symptom:* `woo-mcp` returns `isError: true` with `WooCommerce request failed: ... connection refused`.
+   - *Behavior:* `woo-mcp` remains healthy and responsive (`/healthz` and `/readyz` return 200). Once WordPress restarts and becomes ready, tool calls immediately succeed without restarting `woo-mcp`.
 
 ---
 

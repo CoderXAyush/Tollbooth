@@ -88,7 +88,7 @@ secrets:
 	./deploy/scripts/create-secrets.sh $(NAMESPACE)
 
 # ── Cluster ─────────────────────────────────────────────────
-.PHONY: cluster-up cluster-down test-netpol
+.PHONY: cluster-up cluster-down test-netpol test-woo-mcp-netpol
 
 cluster-up:
 	./deploy/kind/up.sh
@@ -98,3 +98,6 @@ cluster-down:
 
 test-netpol:
 	./deploy/scripts/test-netpol.sh
+
+test-woo-mcp-netpol:
+	./deploy/scripts/test-woo-mcp-netpol.sh

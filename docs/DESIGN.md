@@ -238,6 +238,32 @@ Custom images built on the host (`docker build`) can be loaded directly into Kin
 ### Security Contexts & Privilege Justification
 - **MariaDB:** Runs fully unprivileged with `securityContext`: `runAsNonRoot: true`, `runAsUser: 999`, `fsGroup: 999`.
 - **WordPress:** Runs Apache as root initially because the Linux kernel requires root privileges (`CAP_NET_BIND_SERVICE`) to bind standard HTTP port 80 and initialize log files in `/var/log/apache2`. Once started, Apache immediately drops privileges to the unprivileged `www-data` user (UID 33) for all worker processes handling incoming HTTP requests.
+- **Bootstrap Job:** Runs as `runAsUser: 0` because it executes administrative WP-CLI operations and must run `chown -R 33:33 /var/www/html/wp-content` on the persistent volume so the unprivileged Apache `www-data` worker processes can write uploaded media and plugin assets.
+
+### Persistent Volumes & Pod Scheduling (RWO Multi-Node Affinity)
+Kubernetes `ReadWriteOnce` (RWO) persistent volumes can only be attached to a single cluster node at any given time. If the WordPress web pod and the Bootstrap Job pod were scheduled onto different nodes in a multi-node cluster, the Job pod would fail during volume attachment with a `Multi-Attach error for volume`.
+To eliminate this risk, the Bootstrap Job (`job-bootstrap.yaml`) defines explicit `podAffinity`:
+```yaml
+affinity:
+  podAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      - labelSelector:
+          matchLabels:
+            app.kubernetes.io/name: wordpress
+            app.kubernetes.io/instance: {{ .Release.Name }}
+            app.kubernetes.io/component: store
+        topologyKey: "kubernetes.io/hostname"
+```
+This guarantees that Kubernetes schedules the Bootstrap Job on the exact same node (`kubernetes.io/hostname`) hosting the active WordPress pod, allowing both pods to access the shared RWO volume without volume attachment conflicts.
+
+### NetworkPolicy Matching for Bootstrap Job
+The MariaDB NetworkPolicy podSelector matches pods with labels:
+```yaml
+matchLabels:
+  app.kubernetes.io/name: wordpress
+  app.kubernetes.io/instance: {{ .Release.Name }}
+```
+By omitting `app.kubernetes.io/component: store`, this rule intentionally matches both the WordPress web deployment (`component: store`) and the Bootstrap Job (`component: bootstrap`), granting the temporary bootstrap runner direct MySQL connectivity on port 3306 while blocking all other cluster traffic.
 
 ---
 
@@ -307,11 +333,13 @@ Single namespace simplifies RBAC and service discovery for this project scope. S
 |-------------|-----------|----------|
 | `postgres-credentials` | tollbooth | `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB` |
 | `mariadb-credentials` | tollbooth | `MYSQL_ROOT_PASSWORD`, `MYSQL_USER`, `MYSQL_PASSWORD`, `MYSQL_DATABASE` |
-| `woo-credentials` | tollbooth | `WOO_CONSUMER_KEY`, `WOO_CONSUMER_SECRET` |
+| `wordpress-admin-credentials` | tollbooth | `ADMIN_USER`, `ADMIN_PASSWORD`, `ADMIN_EMAIL` |
+| `woocommerce-api-keys` | tollbooth | `CONSUMER_KEY`, `CONSUMER_SECRET` |
+| `woo-mcp-auth` | tollbooth | `MCP_AUTH_TOKEN` (static Bearer token for woo-mcp) |
 | `tollbooth-kek` | tollbooth | `KEK` (256-bit key for envelope encryption) |
 | `gateway-session-secret` | tollbooth | `SESSION_SECRET` (for cookie signing) |
 
-All secrets are created via `helm install --set` or `kubectl create secret` — never committed to the repo.
+All secrets are created via `deploy/scripts/create-secrets.sh` or `helm install --set` — never committed to the repository.
 
 ### PVCs
 
@@ -327,19 +355,79 @@ All secrets are created via `helm install --set` or `kubectl create secret` — 
 |---------|------|------|-----------------|
 | `gateway` | ClusterIP | 8080 | Ingress, other pods |
 | `dashboard` | ClusterIP | 8080 | Ingress |
-| `woo-mcp` | ClusterIP | 8081 | Gateway pod only |
-| `wordpress` | ClusterIP | 80 | woo-mcp, Ingress (local only for setup) |
-| `mariadb` | ClusterIP | 3306 | WordPress pod only |
+| `woo-mcp` | ClusterIP | 8081 | Gateway pod only (enforced by NetworkPolicy) |
+| `wordpress` | ClusterIP | 80 | woo-mcp, Ingress (storefront) |
+| `mariadb` | ClusterIP | 3306 | WordPress pod only (enforced by NetworkPolicy) |
 | `postgres` | ClusterIP | 5432 | Gateway pod only |
 
-### NetworkPolicy (planned for Chunk 2+)
+### NetworkPolicy Implementation (Active)
 
+1. **`woo-mcp-netpol` (`charts/woo-mcp`):**
+   - **Ingress:** Allows TCP 8081 ONLY from pods with label `app.kubernetes.io/name: gateway`.
+   - **Egress:** Allows DNS (UDP/TCP 53) to `kube-dns` in `kube-system`, and HTTP (TCP 80) ONLY to `app.kubernetes.io/name: wordpress`, `component: store`.
+2. **`wordpress-netpol` (`charts/store`):**
+   - **Ingress:** Allows TCP 80 from ingress controller (`ingress-nginx` namespace) and `app.kubernetes.io/name: woo-mcp`.
+3. **`mariadb-netpol` (`charts/store`):**
+   - **Ingress:** Allows TCP 3306 ONLY from `app.kubernetes.io/name: wordpress` (web store and bootstrap Job).
+
+---
+
+## 11. woo-mcp Upstream Service Architecture & Implementation
+
+### SDK Choice
+The `woo-mcp` service is built with the official Anthropic Model Context Protocol Go SDK:
 ```
-woo-mcp:    ingress only from gateway
-mariadb:    ingress only from wordpress
-postgres:   ingress only from gateway
-wordpress:  ingress only from woo-mcp and ingress-nginx
+github.com/modelcontextprotocol/go-sdk v1.8.0
 ```
+This SDK provides native typed tool definitions, JSON schema generation from Go structs (`jsonschema-go`), and compliant Streamable HTTP transport handlers.
+
+### Stateless Streamable HTTP Transport
+`woo-mcp` is exposed over Streamable HTTP (`/mcp`) using stateless mode:
+```go
+mcpStreamable := mcp.NewStreamableHTTPHandler(func(_ *http.Request) *mcp.Server {
+    return mcpServer
+}, &mcp.StreamableHTTPOptions{
+    Stateless:                  true,
+    DisableLocalhostProtection: true,
+})
+```
+**Why Stateless?**
+- Eliminates in-memory session maps that would break on pod restarts or during rolling deployments.
+- Allows any replica behind the `ClusterIP` Service to handle any request without sticky sessions or session replication.
+- Enables simple, reliable integration for HTTP clients (like the Gateway) using standard JSON-RPC 2.0 over HTTP POST.
+
+### Authentication
+Incoming requests to `/mcp` require Bearer authentication:
+```
+Authorization: Bearer <MCP_AUTH_TOKEN>
+```
+The token is validated in `BearerAuthMiddleware` using `crypto/subtle.ConstantTimeCompare` against the value supplied via `MCP_AUTH_TOKEN` environment variable (mounted from Secret `woo-mcp-auth`). Unauthenticated or invalid requests immediately return `401 Unauthorized` with `Www-Authenticate: Bearer realm="woo-mcp"`.
+
+### Tool Inventory & Honest Annotations
+
+| Tool Name | Title | Description | Annotations |
+|-----------|-------|-------------|-------------|
+| `list_products` | List Products | List products from the WooCommerce catalog with search keyword and pagination filters. | `readOnlyHint: true`, `destructiveHint: false`, `idempotentHint: true` |
+| `get_product` | Get Product | Retrieve detailed information for a single WooCommerce product by unique ID. | `readOnlyHint: true`, `destructiveHint: false`, `idempotentHint: true` |
+| `create_product` | Create Product | Create a new simple product in the WooCommerce catalog with name and decimal price. | `readOnlyHint: false`, `destructiveHint: false`, `idempotentHint: false` |
+| `list_orders` | List Orders | List orders with optional status, date range (ISO 8601 UTC), and pagination filters. | `readOnlyHint: true`, `destructiveHint: false`, `idempotentHint: true` |
+| `get_order` | Get Order | Retrieve details of a specific WooCommerce order by ID, line items, and customer name/email. | `readOnlyHint: true`, `destructiveHint: false`, `idempotentHint: true` |
+| `update_order_status` | Update Order Status | Update the status of an existing WooCommerce order. | `readOnlyHint: false`, `destructiveHint: false`, `idempotentHint: true` |
+
+### PII Protection & Data Sanitization
+1. **`list_orders` PII Exclusion:** Order listings return only operational metadata (`id`, `status`, `total`, `currency`, `date_created`, `payment_method_title`, `line_items`). All customer contact data (name, email, phone number, shipping/billing address) is completely excluded from list responses.
+2. **`get_order` Minimization:** Full order details return only customer name (`first_name`, `last_name`) and `email` for verification purposes. Phone numbers, street addresses, postal codes, and payment transaction tokens are stripped.
+3. **HTML Sanitization:** Product descriptions returned to LLM consumers are stripped of HTML tags using regex sanitization to prevent markup injection or token wastage.
+
+### Date & Time Handling
+- WooCommerce stores order timestamps in UTC under HPOS `wp_wc_orders.date_created_gmt`.
+- All date queries to the WooCommerce REST API include `dates_are_gmt=true` to ensure deterministic query semantics regardless of site timezone configuration.
+- Flexible parsing accepts `RFC3339` (`2026-10-25T00:00:00Z`), ISO 8601 with offset, ISO without timezone, or date-only (`2006-01-02`).
+
+### Error Mapping & Fault Tolerance
+- **Business/API Errors:** When WooCommerce returns 4xx or 5xx HTTP status codes (e.g., 404 Not Found for missing product/order, 400 Bad Request), `woo-mcp` does NOT return transport-level errors or panic. Instead, it returns a valid MCP `CallToolResult` with `isError: true` and a human-readable message. This lets the LLM agent understand the problem and formulate an informative response.
+- **Input Validation:** Parameter validation occurs before network dispatch (e.g., regex `^\d+(\.\d{1,2})?$` on prices, positive IDs, order status enum validation). Invalid parameters return `isError: true` with validation feedback immediately.
+- **Probe Decoupling:** `/healthz` and `/readyz` probes report the status of the `woo-mcp` process itself. If the store goes down or restarts, `woo-mcp` remains Ready (`/readyz` returns 200) and gracefully returns `isError: true` on tool calls rather than crashing or causing Kubernetes restart cascades.
 
 ---
 

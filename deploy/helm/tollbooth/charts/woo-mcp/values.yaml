@@ -1,8 +1,19 @@
 replicaCount: 1
+
 image:
   repository: tollbooth/woo-mcp
   tag: dev
+
+imagePullPolicy: IfNotPresent
 port: 8081
+httpTimeout: 15s
+
+store:
+  host: "store-wordpress"
+  port: 80
+  apiKeysSecret: "woocommerce-api-keys"
+  authSecret: "woo-mcp-auth"
+
 resources:
   requests:
     cpu: 100m
@@ -10,4 +21,9 @@ resources:
   limits:
     cpu: 500m
     memory: 256Mi
+
+networkPolicy:
+  enabled: true
+  gatewayNamespace: ""
+
 env: {}

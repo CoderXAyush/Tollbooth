@@ -3,7 +3,6 @@
 // woo-mcp is an MCP server (Streamable HTTP transport) that exposes
 // WooCommerce store data (products, orders) as MCP tools. It talks to
 // the WooCommerce REST API using consumer key/secret credentials.
-// In this chunk it only serves health and readiness probes.
 package main
 
 import (
@@ -15,52 +14,54 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
+
+	"github.com/CoderXAyush/Tollbooth/services/woo-mcp/internal/client"
+	"github.com/CoderXAyush/Tollbooth/services/woo-mcp/internal/server"
 )
 
 func main() {
-	// ── Logger ──────────────────────────────────────────────
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	// ── Structured Logger ───────────────────────────────────
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
 	slog.SetDefault(logger)
 
-	// ── Config from env ─────────────────────────────────────
-	port := envOr("PORT", "8081")
+	// ── Load & Validate Configuration ────────────────────────
+	cfg, err := server.LoadConfig()
+	if err != nil {
+		slog.Error("failed to load configuration", "error", err)
+		os.Exit(1)
+	}
 
-	// ── HTTP mux ────────────────────────────────────────────
-	mux := http.NewServeMux()
+	// ── WooCommerce Client ──────────────────────────────────
+	wooClient := client.NewWooClient(
+		cfg.WooBaseURL,
+		cfg.WooConsumerKey,
+		cfg.WooConsumerSecret,
+		cfg.HTTPTimeout,
+	)
 
-	// /healthz – liveness probe
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"status":"ok"}`))
-	})
+	// ── Server Handler ──────────────────────────────────────
+	handler := server.NewServerHandler(cfg, wooClient)
 
-	// /readyz – readiness probe. Later chunks will verify WooCommerce
-	// REST API reachability before returning 200.
-	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"status":"ready"}`))
-	})
-
-	// ── Server ──────────────────────────────────────────────
+	// ── HTTP Server ─────────────────────────────────────────
 	srv := &http.Server{
-		Addr:              ":" + port,
-		Handler:           mux,
+		Addr:              ":" + cfg.Port,
+		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       10 * time.Second,
+		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
 
-	// ── Graceful shutdown ───────────────────────────────────
+	// ── Graceful Shutdown ───────────────────────────────────
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	go func() {
-		slog.Info("woo-mcp starting", "port", port)
+		slog.Info("woo-mcp starting", "port", cfg.Port, "store_url", cfg.WooBaseURL)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			slog.Error("listen error", "err", err)
+			slog.Error("listen error", "error", err)
 			os.Exit(1)
 		}
 	}()
@@ -68,17 +69,10 @@ func main() {
 	<-ctx.Done()
 	slog.Info("shutting down gracefully")
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		slog.Error("forced shutdown", "err", err)
+		slog.Error("forced shutdown", "error", err)
 	}
 	slog.Info("woo-mcp stopped")
-}
-
-func envOr(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
 }

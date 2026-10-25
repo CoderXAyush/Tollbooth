@@ -78,4 +78,16 @@ else
   echo "  [+] Secret 'woocommerce-api-keys' created in '${NAMESPACE}'"
 fi
 
+# 5. woo-mcp static Bearer auth token
+if kubectl get secret woo-mcp-auth -n "${NAMESPACE}" >/dev/null 2>&1; then
+  echo "  [✓] Secret 'woo-mcp-auth' already exists in '${NAMESPACE}'"
+else
+  AUTH_TOKEN=$(rand_str)
+  kubectl create secret generic woo-mcp-auth \
+    --namespace="${NAMESPACE}" \
+    --from-literal=MCP_AUTH_TOKEN="${AUTH_TOKEN}" \
+    --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+  echo "  [+] Secret 'woo-mcp-auth' created in '${NAMESPACE}'"
+fi
+
 echo "==> All required secrets are verified in '${NAMESPACE}'."

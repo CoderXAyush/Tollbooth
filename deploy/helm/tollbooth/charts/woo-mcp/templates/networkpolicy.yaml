@@ -1,0 +1,58 @@
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Release.Name }}-woo-mcp-netpol
+  labels:
+    app.kubernetes.io/name: woo-mcp
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: network-policy
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: woo-mcp
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # 1. Allow incoming traffic ONLY from pods labelled as the gateway
+    # Uses namespaceSelector plus podSelector so the gateway may live in a different namespace later.
+    - from:
+        - namespaceSelector:
+            {{- if .Values.networkPolicy.gatewayNamespace }}
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.gatewayNamespace }}
+            {{- else }}
+            {}
+            {{- end }}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: gateway
+      ports:
+        - protocol: TCP
+          port: {{ .Values.port }}
+  egress:
+    # 1. DNS egress to CoreDNS / kube-dns in kube-system
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # 2. HTTP egress ONLY to the store's WordPress service
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: wordpress
+              app.kubernetes.io/component: store
+      ports:
+        - protocol: TCP
+          port: {{ .Values.store.port | default 80 }}
+{{- end }}

@@ -21,12 +21,19 @@ spec:
     spec:
       securityContext:
         runAsNonRoot: true
-        runAsUser: 65534
-        fsGroup: 65534
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
       containers:
         - name: woo-mcp
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
-          imagePullPolicy: {{ .Values.global.imagePullPolicy | default "IfNotPresent" }}
+          imagePullPolicy: {{ if and .Values.global .Values.global.imagePullPolicy }}{{ .Values.global.imagePullPolicy }}{{ else }}{{ .Values.imagePullPolicy | default "IfNotPresent" }}{{ end }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
           ports:
             - name: http
               containerPort: {{ .Values.port }}
@@ -34,6 +41,25 @@ spec:
           env:
             - name: PORT
               value: {{ .Values.port | quote }}
+            - name: WOO_BASE_URL
+              value: "http://{{ .Values.store.host }}:{{ .Values.store.port }}"
+            - name: WOO_CONSUMER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.store.apiKeysSecret | default "woocommerce-api-keys" }}
+                  key: CONSUMER_KEY
+            - name: WOO_CONSUMER_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.store.apiKeysSecret | default "woocommerce-api-keys" }}
+                  key: CONSUMER_SECRET
+            - name: MCP_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.store.authSecret | default "woo-mcp-auth" }}
+                  key: MCP_AUTH_TOKEN
+            - name: HTTP_TIMEOUT
+              value: {{ .Values.httpTimeout | default "15s" | quote }}
             {{- range $key, $value := .Values.env }}
             - name: {{ $key }}
               value: {{ $value | quote }}
