@@ -1,0 +1,61 @@
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Release.Name }}-wordpress-netpol
+  labels:
+    app.kubernetes.io/name: wordpress
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: network-policy
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: wordpress
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: store
+  policyTypes:
+    - Ingress
+  ingress:
+    # 1. Allow HTTP traffic from ingress controller in ingressNamespace
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.ingressNamespace | default "ingress-nginx" }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.wordpress.port | default 80 }}
+    # 2. Allow HTTP traffic from woo-mcp pods in the same namespace
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: woo-mcp
+      ports:
+        - protocol: TCP
+          port: {{ .Values.wordpress.port | default 80 }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Release.Name }}-mariadb-netpol
+  labels:
+    app.kubernetes.io/name: mariadb
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: network-policy
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: mariadb
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  policyTypes:
+    - Ingress
+  ingress:
+    # Allow MySQL traffic ONLY from WordPress web pods and the bootstrap Job
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: wordpress
+              app.kubernetes.io/instance: {{ .Release.Name }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.mariadb.port | default 3306 }}
+{{- end }}

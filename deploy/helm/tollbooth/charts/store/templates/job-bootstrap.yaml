@@ -23,14 +23,13 @@ spec:
       restartPolicy: OnFailure
       affinity:
         podAffinity:
-          preferredDuringSchedulingIgnoredDuringExecution:
-            - weight: 100
-              podAffinityTerm:
-                labelSelector:
-                  matchLabels:
-                    app.kubernetes.io/name: wordpress
-                    app.kubernetes.io/instance: {{ .Release.Name }}
-                topologyKey: "kubernetes.io/hostname"
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: wordpress
+                  app.kubernetes.io/instance: {{ .Release.Name }}
+                  app.kubernetes.io/component: store
+              topologyKey: "kubernetes.io/hostname"
       containers:
         - name: bootstrap
           image: "{{ .Values.bootstrap.image.repository }}:{{ .Values.bootstrap.image.tag }}"

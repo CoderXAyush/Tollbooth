@@ -60,3 +60,7 @@ ingress:
   className: nginx
   host: "store.127.0.0.1.nip.io"
   tls: []
+
+networkPolicy:
+  enabled: true
+  ingressNamespace: ingress-nginx
