@@ -487,6 +487,93 @@ nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
 
 ---
 
+---
+
+## 13. Gateway Core: Aggregation, Routing, and Failure Isolation (Chunk 3 Part B)
+
+### Aggregation Flow
+The Tollbooth Gateway acts as an aggregation and routing pass-through layer across registered upstream Model Context Protocol (MCP) servers:
+1. **Tool Discovery & Parallel Fan-out:** On startup and periodically (default every 10s), the gateway fans out across all enabled upstream servers in parallel using individual goroutines with per-upstream deadlines. A slow or hanging upstream never blocks or delays healthy upstreams.
+2. **In-Memory Cache & Snapshotting:** Validated tools from connected servers are cached in-memory and synchronized to the `mcp_tools` PostgreSQL table. When an incoming MCP request arrives at `/mcp`, the gateway takes an instantaneous snapshot of the cache.
+3. **Stateless Request Handling:** The gateway's `/mcp` handler instantiates a new stateless `mcp.Server` per request, populating registered tools directly from the cache snapshot. Incoming JSON-RPC calls are mapped directly to the appropriate upstream client.
+
+```
+Client (MCP Inspector / LLM)
+    │
+    ▼ (POST /mcp with Bearer token)
+Gateway (Streamable HTTP, Stateless)
+    │
+    ├─► tools/list: Snapshot of connected tools [<slug>__<tool>]
+    │
+    └─► tools/call: Split on first "__" -> [<slug>, <origin_tool>]
+           │
+           ├─► Check server enabled & Connected
+           ├─► RoundTripper strips client auth, injects upstream credential
+           ├─► context.WithTimeout(callCtx, timeout)
+           ├─► Retry once if 404/ErrSessionMissing
+           ├─► Enforce response size cap (4 MiB)
+           ├─► CallRecorder telemetries duration, user, outcome
+           │
+           ▼ (Streamable HTTP POST)
+Upstream Server (e.g. woo-mcp)
+```
+
+### Naming & Validation
+- **Namespacing Scheme:** Exposed tool names follow `<slug>__<origin_tool>`.
+- **Character & Length Rules:** Exposed names must match `^[a-zA-Z0-9_-]{1,64}$`. Slugs are restricted to `^[a-z0-9]([a-z0-9-]{0,18}[a-z0-9])?$`.
+- **Delimiters:** The separator is the double-underscore `__`. Slugs contain no underscores, so splitting on the **first** `__` always unambiguously separates the server slug from the origin tool name, even if the origin tool name itself contains underscores.
+- **Skipping Invalid Tools:** Tools whose names exceed 64 characters or contain forbidden characters are skipped during discovery (never truncated, which could cause collision hazards), a warning is logged, and the server's warnings counter is incremented.
+- **Collision Prevention:** Because server slugs are enforced unique in the PostgreSQL database, collisions between tools with identical names across distinct upstreams (e.g., `woo__list_products` and `woo-b__list_products`) are completely avoided.
+- **Untrusted Descriptions:** Tool descriptions are capped at 2000 characters and stripped of control characters (preserving tab, newline, and carriage return). The gateway never injects extraneous text into descriptions to avoid prompt injection vulnerabilities.
+
+### Timeout & Health State Machine
+Each upstream server transitions between three states:
+- **`connected`:** Tool listings and health checks succeed. Tools are exposed in `tools/list`.
+- **`unreachable`:** Connection failed or timed out. Consecutive failure count increments. Exponential backoff with 20% jitter is applied to prevent connection storms. Tools belonging to an unreachable server are **omitted from `tools/list`**, and direct calls immediately return `isError: true` with `"server '<slug>' is unreachable"`. On recovery, status flips to `connected`, failure count resets, and tools return.
+- **`disabled`:** The server is manually turned off by an admin (`enabled: false`). Tools are completely omitted from `tools/list` and background health checks do not poll it.
+
+### Stateless Handler Design
+The Go MCP SDK (`github.com/modelcontextprotocol/go-sdk`) supports stateless Streamable HTTP servers:
+```go
+mcp.NewStreamableHTTPHandler(func(req *http.Request) *mcp.Server {
+    return manager.BuildServerForRequest(req)
+}, &mcp.StreamableHTTPOptions{
+    Stateless: true,
+    DisableLocalhostProtection: true,
+})
+```
+- In stateless mode, the server handles each HTTP POST in an ephemeral session without retaining session state across requests.
+- For `tools/list`, `BuildServerForRequest` adds only tools from currently connected & enabled servers.
+- For `tools/call`, `BuildServerForRequest` adds all tools, allowing the handler to catch unreachable or disabled servers and return clear, informative `isError` responses.
+- Any replica in a Kubernetes cluster can serve any incoming request without sticky sessions.
+
+### Credential Isolation via Custom RoundTripper
+When the gateway connects to an upstream MCP server, it uses an `http.Client` with `UpstreamRoundTripper`:
+- Clones the outgoing request to prevent mutation leaks.
+- Explicitly deletes the client's `Authorization` header (`clonedReq.Header.Del("Authorization")`).
+- Injects only the specific upstream server's configured credential (`Bearer <token>` or custom header `<Name>: <Value>`).
+- Client tokens (such as bootstrap tokens or user session cookies) can **never** be forwarded or leaked to third-party or upstream MCP servers.
+
+### CallRecorder Interface
+Every tool call through the gateway invokes the `CallRecorder` interface:
+```go
+type CallRecord struct {
+    User       string        `json:"user"`
+    ServerSlug string        `json:"server_slug"`
+    Tool       string        `json:"tool"`
+    StartedAt  time.Time     `json:"started_at"`
+    Duration   time.Duration `json:"duration"`
+    Outcome    string        `json:"outcome"` // "success", "error", "timeout"
+    Error      string        `json:"error,omitempty"`
+}
+```
+In Chunk 3, `SlogCallRecorder` outputs structured logs with duration, outcome, and sanitised errors. In Chunk 4, this interface is backed by PostgreSQL audit logging.
+
+### Ingress Streaming Configuration
+The gateway Ingress (`gateway.127.0.0.1.nip.io`) disables proxy buffering (`proxy-buffering: "off"`) and configures long read/send timeouts (`3600s`). This ensures chunked responses and Server-Sent Events (SSE) stream without buffering delays to LLMs, and lengthy tool executions do not experience premature proxy disconnects.
+
+---
+
 ## Open Questions
 
 1. **Session store:** Should we use PostgreSQL for session storage or switch to Redis? PostgreSQL is simpler (fewer moving parts) but Redis handles TTL natively. Current decision: PostgreSQL, revisit if session volume becomes a concern.
@@ -498,4 +585,5 @@ nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
 4. **Webhook support:** WooCommerce supports webhooks for real-time updates. Should woo-mcp expose a webhook receiver so tools can return fresher data? Defer to post-MVP.
 
 5. **Key rotation automation:** The KEK rotation process is manual (re-encrypt DEKs). Should we automate this with a CronJob? Defer.
+
 

@@ -14,7 +14,9 @@ import (
 	"github.com/CoderXAyush/Tollbooth/services/gateway/internal/auth"
 	"github.com/CoderXAyush/Tollbooth/services/gateway/internal/crypto"
 	"github.com/CoderXAyush/Tollbooth/services/gateway/internal/db"
+	"github.com/CoderXAyush/Tollbooth/services/gateway/internal/mcpendpoint"
 	"github.com/CoderXAyush/Tollbooth/services/gateway/internal/registry"
+	"github.com/CoderXAyush/Tollbooth/services/gateway/internal/upstream"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -108,6 +110,24 @@ func main() {
 
 	regHandler := registry.NewHandler(repo)
 
+	// ── Upstream Manager & Tools Cache ───────────────────────
+	toolsRepo := upstream.NewPostgresToolsRepository(pgxPool)
+	callRecorder := upstream.NewSlogCallRecorder(logger)
+
+	upstreamMgr := upstream.NewManager(upstream.ManagerOptions{
+		Repo:      repo,
+		ToolsRepo: toolsRepo,
+		Recorder:  callRecorder,
+	})
+
+	if err := upstreamMgr.Start(ctx); err != nil {
+		slog.Warn("upstream manager start encountered issues", "err", err)
+	}
+	defer upstreamMgr.Stop()
+
+	// ── MCP Endpoint Handler ────────────────────────────────
+	mcpHandler := mcpendpoint.NewHandler(upstreamMgr)
+
 	// ── HTTP mux ────────────────────────────────────────────
 	mux := http.NewServeMux()
 
@@ -142,14 +162,17 @@ func main() {
 	mux.Handle("/api/servers", authMiddleware(apiMux))
 	mux.Handle("/api/servers/", authMiddleware(apiMux))
 
+	// Mount protected MCP endpoint at /mcp
+	mux.Handle("/mcp", authMiddleware(mcpHandler))
+
 	// ── Server ──────────────────────────────────────────────
 	srv := &http.Server{
 		Addr:              ":" + port,
 		Handler:           mux,
-		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      30 * time.Second,
-		IdleTimeout:       60 * time.Second,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       60 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	// ── Graceful shutdown ───────────────────────────────────

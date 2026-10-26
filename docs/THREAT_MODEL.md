@@ -136,3 +136,16 @@ This document identifies security-relevant design decisions and their rationale.
 - Credentials are strictly write-only: API responses never serialize encrypted or decrypted credentials, returning only a `has_credential: true/false` indicator.
 - Database access is restricted at the network layer by `postgres-netpol` exclusively to pods carrying `app.kubernetes.io/name: gateway`.
 
+---
+
+## 11. Member Access to Shared Upstream Credentials (The "Blind Execution" Problem)
+
+**Threat:** Members have permission to call tools (e.g. `woo__create_product`, `woo__update_order_status`) which are executed upstream using powerful administrative credentials (e.g. WooCommerce REST consumer keys). Even though the member **never sees** the actual credential (it is encrypted at rest and write-only), they could use the tool interface to perform unauthorized business operations or spam modifications.
+
+**Mitigations:**
+- **Granular Tool Definitions:** Upstream tools do not provide arbitrary SQL or script execution. They expose strictly validated, typed operations (e.g. updating order status, listing orders with sanitized filters).
+- **Comprehensive Audit Trail:** Every invocation records the authenticated caller identity, server, tool name, execution timestamp, duration, and outcome. In Chunk 4, this is permanently written to an append-only PostgreSQL `audit_log` table.
+- **Client Token Decoupling:** Client tokens are never forwarded upstream. Upstream servers only accept the gateway's credential, preserving the gateway as an immutable enforcement and auditing checkpoint.
+- **Role Permissions (Chunk 4):** Administrative endpoints (server registration, user role management, credential modification) are strictly barred from member roles.
+
+

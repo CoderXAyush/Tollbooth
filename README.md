@@ -5,14 +5,15 @@ A WooCommerce hosting platform with a team MCP (Model Context Protocol) gateway 
 ## Status
 
 | Chunk | Description | Status |
-|-------|-------------|--------|
+|---|---|---|
 | 0 | Foundations, contracts, repo scaffold | ✅ Done |
 | 1 | Cluster bootstrap, WordPress + WooCommerce deploy | ✅ Done |
 | 2 | woo-mcp server implementation | ✅ Done |
-| 3 | Gateway core (aggregation, routing, failure isolation) | 🔄 Part A Done (`chunk-3a`), Part B in progress |
-| 4 | Dashboard UI | 🔲 Not started |
-| 5 | Chat agent | 🔲 Not started |
-| 6 | Production deployment (VPS/k3s) | 🔲 Not started |
+| 3 | Gateway core (aggregation, routing, failure isolation) | ✅ Done (`chunk-3`) |
+| 4 | Users, roles, API keys, audit log | 🔲 Not started |
+| 5 | Dashboard UI | 🔲 Not started |
+| 6 | Chat agent | 🔲 Not started |
+| 7 | Production deployment (VPS/k3s) | 🔲 Not started |
 
 ## Architecture Overview
 
@@ -340,6 +341,69 @@ npx @modelcontextprotocol/inspector
 
 ---
 
+## Gateway Core: MCP Aggregator & Registry (Chunk 3)
+
+The Gateway exposes an aggregated Model Context Protocol (MCP) endpoint over Streamable HTTP at `/mcp`, and a REST API for server management at `/api/servers`.
+
+### 1. Retrieve the Temporary Bootstrap Token
+```bash
+BOOTSTRAP_TOKEN=$(kubectl get secret gateway-bootstrap-token -n tollbooth -o jsonpath='{.data.BOOTSTRAP_TOKEN}' | base64 -d)
+echo "Bootstrap Token: ${BOOTSTRAP_TOKEN}"
+```
+
+### 2. Query Aggregated Tools (`tools/list`)
+All tools are namespaced by server slug (`<slug>__<tool>`). Unreachable or disabled servers' tools are automatically omitted:
+```bash
+curl -s -H "Authorization: Bearer ${BOOTSTRAP_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' \
+  http://gateway.127.0.0.1.nip.io/mcp
+```
+
+### 3. Call an Aggregated Tool (`tools/call`)
+Calls are routed by prefix to the target upstream with context timeouts, failure isolation, and sanitised error messages:
+```bash
+# List products through the primary WooCommerce upstream (slug: woo)
+curl -s -H "Authorization: Bearer ${BOOTSTRAP_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"woo__list_products","arguments":{"per_page":2}}}' \
+  http://gateway.127.0.0.1.nip.io/mcp
+
+# Create a new product through the gateway
+curl -s -H "Authorization: Bearer ${BOOTSTRAP_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"woo__create_product","arguments":{"name":"Gateway Mug","regular_price":"14.99"}}}' \
+  http://gateway.127.0.0.1.nip.io/mcp
+```
+
+### 4. Register and Manage Upstream Servers via REST API
+```bash
+# Register a new upstream server
+curl -s -X POST -H "Authorization: Bearer ${BOOTSTRAP_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d '{"slug":"woo-b","name":"Secondary Store","url":"http://woo-b-woo-mcp:8081/mcp","credential":"<UPSTREAM_SECRET>","enabled":true}' \
+  http://gateway.127.0.0.1.nip.io/api/servers
+
+# List registered servers and their health status
+curl -s -H "Authorization: Bearer ${BOOTSTRAP_TOKEN}" \
+  http://gateway.127.0.0.1.nip.io/api/servers
+
+# Test connection to an upstream server
+curl -s -X POST -H "Authorization: Bearer ${BOOTSTRAP_TOKEN}" \
+  http://gateway.127.0.0.1.nip.io/api/servers/<SERVER_ID>/test
+
+# Disable a server (omits its tools from /mcp tools/list)
+curl -s -X PUT -H "Authorization: Bearer ${BOOTSTRAP_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d '{"enabled":false}' \
+  http://gateway.127.0.0.1.nip.io/api/servers/<SERVER_ID>
+```
+
+---
+
 ## Troubleshooting
 
 1. **MariaDB TLS Negotiation (`TLS/SSL error: self-signed certificate`):**
@@ -371,11 +435,20 @@ npx @modelcontextprotocol/inspector
    - *Symptom:* `woo-mcp` returns `isError: true` with `WooCommerce request failed: ... connection refused`.
    - *Behavior:* `woo-mcp` remains healthy and responsive (`/healthz` and `/readyz` return 200). Once WordPress restarts and becomes ready, tool calls immediately succeed without restarting `woo-mcp`.
 
+7. **Multi-Release Helm Chart Service Conflicts:**
+   - *Symptom:* Installing a second instance of `woo-mcp` chart (e.g. `woo-b`) failed with `Service "woo-mcp" already exists`.
+   - *Cause:* Subchart defined a static un-templated Service name `woo-mcp` in addition to `{{ .Release.Name }}-woo-mcp`.
+   - *Fix:* Scoped the un-prefixed alias service conditionally to `.Release.Name == "woo-mcp"` and added `app.kubernetes.io/instance: {{ .Release.Name }}` pod selectors.
+
+8. **NGINX Ingress SSE / Chunk Buffering:**
+   - *Symptom:* Streamable HTTP responses to MCP clients block until the full response finishes instead of streaming events in real time.
+   - *Cause:* Ingress NGINX buffers proxy responses by default.
+   - *Fix:* Added `nginx.ingress.kubernetes.io/proxy-buffering: "off"` and extended read timeouts to 3600 seconds.
+
 ---
 
 ## How to Connect an External MCP Client
-
-> Coming in Chunk 3.
+Connect any MCP-compliant client (e.g. Claude Desktop, Cursor, MCP Inspector) to `http://gateway.127.0.0.1.nip.io/mcp` using Streamable HTTP transport with header `Authorization: Bearer <BOOTSTRAP_TOKEN>`.
 
 ## How to Use the Chat Agent
 

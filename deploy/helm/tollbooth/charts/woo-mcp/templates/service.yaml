@@ -1,3 +1,4 @@
+{{- if eq .Release.Name "woo-mcp" }}
 apiVersion: v1
 kind: Service
 metadata:
@@ -14,7 +15,9 @@ spec:
       name: http
   selector:
     app.kubernetes.io/name: woo-mcp
+    app.kubernetes.io/instance: {{ .Release.Name }}
 ---
+{{- end }}
 apiVersion: v1
 kind: Service
 metadata:
@@ -31,3 +34,4 @@ spec:
       name: http
   selector:
     app.kubernetes.io/name: woo-mcp
+    app.kubernetes.io/instance: {{ .Release.Name }}
