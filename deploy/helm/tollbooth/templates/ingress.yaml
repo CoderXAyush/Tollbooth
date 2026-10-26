@@ -7,6 +7,9 @@ metadata:
     app.kubernetes.io/instance: {{ .Release.Name }}
   annotations:
     nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
 spec:
   ingressClassName: {{ .Values.ingress.className }}
   {{- if .Values.ingress.tls }}
@@ -31,7 +34,21 @@ spec:
                 name: {{ .Release.Name }}-dashboard
                 port:
                   number: 8080
-    # Gateway API + MCP endpoint
+    # Gateway (MCP & Registry API)
+    {{- if .Values.ingress.hosts.gateway }}
+    - host: {{ .Values.ingress.hosts.gateway }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ .Release.Name }}-gateway
+                port:
+                  number: 8080
+    {{- end }}
+    # API alias for Gateway
+    {{- if .Values.ingress.hosts.api }}
     - host: {{ .Values.ingress.hosts.api }}
       http:
         paths:
@@ -42,6 +59,7 @@ spec:
                 name: {{ .Release.Name }}-gateway
                 port:
                   number: 8080
+    {{- end }}
     {{- if .Values.store.enabled }}
     # WordPress store (local dev / admin access)
     - host: {{ .Values.ingress.hosts.store }}

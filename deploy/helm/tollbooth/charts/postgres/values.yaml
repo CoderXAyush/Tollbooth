@@ -2,6 +2,7 @@ image:
   repository: postgres
   tag: "16-alpine"
 port: 5432
+existingSecret: "postgres-credentials"
 storage:
   size: 1Gi
   storageClass: ""
@@ -12,3 +13,5 @@ resources:
   limits:
     cpu: 500m
     memory: 512Mi
+networkPolicy:
+  enabled: true

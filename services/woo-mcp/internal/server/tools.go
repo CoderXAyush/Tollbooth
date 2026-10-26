@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"regexp"
 	"strconv"
 	"strings"
@@ -16,6 +17,9 @@ import (
 
 var (
 	priceRegex = regexp.MustCompile(`^\d+(\.\d{1,2})?$`)
+	urlRegex   = regexp.MustCompile(`https?://[^\s"'>]+`)
+	ipRegex    = regexp.MustCompile(`\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(?::\d+)?\b`)
+	hostRegex  = regexp.MustCompile(`\b[a-zA-Z0-9.-]+\.(?:tollbooth|svc|cluster\.local|nip\.io)(?::\d+)?\b`)
 
 	validOrderStatuses = map[string]bool{
 		"pending":    true,
@@ -26,6 +30,15 @@ var (
 		"refunded":   true,
 		"failed":     true,
 		"trash":      true,
+	}
+
+	validUpdateOrderStatuses = map[string]bool{
+		"pending":    true,
+		"processing": true,
+		"on-hold":    true,
+		"completed":  true,
+		"cancelled":  true,
+		"failed":     true,
 	}
 
 	validProductStatuses = map[string]bool{
@@ -94,8 +107,8 @@ type CreateProductInput struct {
 // ListOrdersInput represents inputs for listing orders.
 type ListOrdersInput struct {
 	Status  string `json:"status,omitempty" jsonschema:"Order status filter: any, pending, processing, on-hold, completed, cancelled, refunded, failed, trash"`
-	After   string `json:"after,omitempty" jsonschema:"Limit results to orders created after this date/time in ISO 8601 format (e.g. 2026-10-25T00:00:00Z)"`
-	Before  string `json:"before,omitempty" jsonschema:"Limit results to orders created before this date/time in ISO 8601 format (e.g. 2026-10-25T23:59:59Z)"`
+	After   string `json:"after,omitempty" jsonschema:"Limit results to orders created after this UTC date/time in ISO 8601 format (e.g. 2026-10-25T00:00:00Z)"`
+	Before  string `json:"before,omitempty" jsonschema:"Limit results to orders created before this UTC date/time in ISO 8601 format (e.g. 2026-10-25T23:59:59Z)"`
 	Page    int    `json:"page,omitempty" jsonschema:"Page number to retrieve (starts at 1)"`
 	PerPage int    `json:"per_page,omitempty" jsonschema:"Number of items per page (1-50, default 20)"`
 }
@@ -106,7 +119,7 @@ type OrderSummary struct {
 	Status             string            `json:"status"`
 	Total              string            `json:"total"`
 	Currency           string            `json:"currency"`
-	DateCreated        string            `json:"date_created"`
+	DateCreatedGMT     string            `json:"date_created_gmt"`
 	PaymentMethodTitle string            `json:"payment_method_title"`
 	LineItems          []LineItemSummary `json:"line_items"`
 }
@@ -145,7 +158,7 @@ type OrderDetail struct {
 	Status             string           `json:"status"`
 	Total              string           `json:"total"`
 	Currency           string           `json:"currency"`
-	DateCreated        string           `json:"date_created"`
+	DateCreatedGMT     string           `json:"date_created_gmt"`
 	PaymentMethodTitle string           `json:"payment_method_title"`
 	Customer           CustomerContact  `json:"customer"`
 	LineItems          []LineItemDetail `json:"line_items"`
@@ -154,7 +167,7 @@ type OrderDetail struct {
 // UpdateOrderStatusInput represents inputs for updating order status.
 type UpdateOrderStatusInput struct {
 	ID     int    `json:"id" jsonschema:"Unique order ID"`
-	Status string `json:"status" jsonschema:"New order status: pending, processing, on-hold, completed, cancelled, refunded, failed, trash"`
+	Status string `json:"status" jsonschema:"New order status: pending, processing, on-hold, completed, cancelled, failed"`
 }
 
 // OrderStatusUpdateResult represents the result of updating an order's status.
@@ -191,16 +204,50 @@ func toolSuccessResult[T any](val T) (*mcp.CallToolResult, T, error) {
 	}, val, nil
 }
 
+// sanitizeText removes hostnames, IPs, ports, and URLs from text to prevent leakage.
+func sanitizeText(text string) string {
+	text = urlRegex.ReplaceAllString(text, "[redacted-url]")
+	text = ipRegex.ReplaceAllString(text, "[redacted-ip]")
+	text = hostRegex.ReplaceAllString(text, "[redacted-host]")
+	return text
+}
+
+// formatRFC3339Z parses timestamp and formats as RFC3339 in UTC with Z suffix.
+func formatRFC3339Z(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	formats := []string{
+		time.RFC3339,
+		"2006-01-02T15:04:05Z07:00",
+		"2006-01-02T15:04:05",
+		"2006-01-02 15:04:05",
+		"2006-01-02",
+	}
+	for _, f := range formats {
+		if t, err := time.Parse(f, s); err == nil {
+			return t.UTC().Format(time.RFC3339)
+		}
+	}
+	if !strings.HasSuffix(s, "Z") {
+		return s + "Z"
+	}
+	return s
+}
+
 // mapClientError maps client/network errors to sanitised tool error messages.
 func mapClientError[T any](err error) (*mcp.CallToolResult, T, error) {
+	slog.Error("woocommerce upstream client error", "err", err)
 	if errors.Is(err, context.DeadlineExceeded) {
 		return toolErrorResult[T]("WooCommerce request timed out")
 	}
 	var apiErr *client.APIError
 	if errors.As(err, &apiErr) {
-		return toolErrorResult[T](fmt.Sprintf("WooCommerce API error (%d): %s", apiErr.StatusCode, apiErr.Message))
+		cleanMsg := sanitizeText(apiErr.Message)
+		return toolErrorResult[T](fmt.Sprintf("WooCommerce API error (%d): %s", apiErr.StatusCode, cleanMsg))
 	}
-	return toolErrorResult[T](fmt.Sprintf("WooCommerce request failed: %v", err))
+	return toolErrorResult[T]("WooCommerce upstream request failed")
 }
 
 // parseFlexibleISO8601 parses standard ISO 8601 strings (RFC3339, dates without offset, or date-only).
@@ -430,7 +477,7 @@ func handleListOrders(woo client.Client) mcp.ToolHandlerFor[ListOrdersInput, []O
 				Status:             o.Status,
 				Total:              o.Total,
 				Currency:           o.Currency,
-				DateCreated:        o.DateCreatedGMT,
+				DateCreatedGMT:     formatRFC3339Z(o.DateCreatedGMT),
 				PaymentMethodTitle: o.PaymentMethodTitle,
 				LineItems:          items,
 			})
@@ -467,7 +514,7 @@ func handleGetOrder(woo client.Client) mcp.ToolHandlerFor[GetOrderInput, *OrderD
 			Status:             o.Status,
 			Total:              o.Total,
 			Currency:           o.Currency,
-			DateCreated:        o.DateCreatedGMT,
+			DateCreatedGMT:     formatRFC3339Z(o.DateCreatedGMT),
 			PaymentMethodTitle: o.PaymentMethodTitle,
 			Customer: CustomerContact{
 				FirstName: o.Billing.FirstName,
@@ -487,8 +534,8 @@ func handleUpdateOrderStatus(woo client.Client) mcp.ToolHandlerFor[UpdateOrderSt
 		}
 
 		status := strings.ToLower(strings.TrimSpace(input.Status))
-		if !validOrderStatuses[status] {
-			return toolErrorResult[*OrderStatusUpdateResult]("invalid status; valid options: pending, processing, on-hold, completed, cancelled, refunded, failed, trash")
+		if !validUpdateOrderStatuses[status] {
+			return toolErrorResult[*OrderStatusUpdateResult]("invalid status; valid options: pending, processing, on-hold, completed, cancelled, failed")
 		}
 
 		o, err := woo.UpdateOrderStatus(ctx, input.ID, status)
@@ -503,7 +550,7 @@ func handleUpdateOrderStatus(woo client.Client) mcp.ToolHandlerFor[UpdateOrderSt
 		res := &OrderStatusUpdateResult{
 			ID:           o.ID,
 			Status:       o.Status,
-			DateModified: dateMod,
+			DateModified: formatRFC3339Z(dateMod),
 		}
 		return toolSuccessResult(res)
 	}
@@ -558,7 +605,7 @@ func RegisterTools(server *mcp.Server, woo client.Client) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "list_orders",
 		Title:       "List Orders",
-		Description: "List WooCommerce store orders with optional status, date range (ISO 8601 UTC), and pagination filters. Dates are evaluated against UTC order timestamps.",
+		Description: "List WooCommerce store orders with optional status, date range (ISO 8601 UTC), and pagination filters. All date filters ('after' and 'before') are evaluated in UTC against order creation times in UTC (date_created_gmt).",
 		Annotations: &mcp.ToolAnnotations{
 			ReadOnlyHint:    true,
 			DestructiveHint: &boolFalse,
@@ -570,7 +617,7 @@ func RegisterTools(server *mcp.Server, woo client.Client) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "get_order",
 		Title:       "Get Order",
-		Description: "Retrieve details of a specific WooCommerce order by ID, including line items and customer contact name/email.",
+		Description: "Retrieve details of a specific WooCommerce order by ID, returning UTC timestamp (date_created_gmt), line items, and customer contact name/email.",
 		Annotations: &mcp.ToolAnnotations{
 			ReadOnlyHint:    true,
 			DestructiveHint: &boolFalse,
@@ -582,7 +629,7 @@ func RegisterTools(server *mcp.Server, woo client.Client) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "update_order_status",
 		Title:       "Update Order Status",
-		Description: "Update the status of an existing WooCommerce order.",
+		Description: "Update the status of an existing WooCommerce order (allowed: pending, processing, on-hold, completed, cancelled, failed).",
 		Annotations: &mcp.ToolAnnotations{
 			ReadOnlyHint:    false,
 			DestructiveHint: &boolFalse,

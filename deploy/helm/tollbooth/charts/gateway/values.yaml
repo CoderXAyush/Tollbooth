@@ -3,6 +3,29 @@ image:
   repository: tollbooth/gateway
   tag: dev
 port: 8080
+
+postgres:
+  host: "postgres"
+  port: 5432
+  existingSecret: "postgres-credentials"
+
+encryptionKeySecret: "gateway-encryption-key"
+bootstrapTokenSecret: "gateway-bootstrap-token"
+wooAuthSecret: "woo-mcp-auth"
+
+seedWoo:
+  enabled: true
+  url: "http://woo-mcp:8081/mcp"
+
+networkPolicy:
+  enabled: true
+  allowExternalEgress: false
+
+ingress:
+  enabled: true
+  className: nginx
+  host: gateway.127.0.0.1.nip.io
+
 resources:
   requests:
     cpu: 100m
@@ -10,4 +33,5 @@ resources:
   limits:
     cpu: 500m
     memory: 256Mi
+
 env: {}

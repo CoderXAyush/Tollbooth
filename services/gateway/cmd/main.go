@@ -1,8 +1,4 @@
 // Package main is the entrypoint for the Tollbooth gateway service.
-//
-// The gateway is both an MCP client (connecting to upstream servers like woo-mcp)
-// and an MCP server (exposing aggregated tools to the dashboard and external
-// clients). In this chunk it only serves health and readiness probes.
 package main
 
 import (
@@ -14,6 +10,12 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
+
+	"github.com/CoderXAyush/Tollbooth/services/gateway/internal/auth"
+	"github.com/CoderXAyush/Tollbooth/services/gateway/internal/crypto"
+	"github.com/CoderXAyush/Tollbooth/services/gateway/internal/db"
+	"github.com/CoderXAyush/Tollbooth/services/gateway/internal/registry"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 func main() {
@@ -21,29 +23,124 @@ func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
 
-	// ── Config from env ─────────────────────────────────────
+	// ── Configuration from environment ──────────────────────
 	port := envOr("PORT", "8080")
+	pgHost := envOr("POSTGRES_HOST", "postgres")
+	pgPort := envOr("POSTGRES_PORT", "5432")
+	pgUser := envOr("POSTGRES_USER", "tollbooth")
+	pgPass := os.Getenv("POSTGRES_PASSWORD")
+	pgDB := envOr("POSTGRES_DB", "tollbooth")
+
+	encKeyStr := os.Getenv("GATEWAY_ENCRYPTION_KEY")
+	if encKeyStr == "" {
+		slog.Error("GATEWAY_ENCRYPTION_KEY environment variable is required")
+		os.Exit(1)
+	}
+
+	bootstrapToken := os.Getenv("GATEWAY_BOOTSTRAP_TOKEN")
+	if bootstrapToken == "" {
+		slog.Error("GATEWAY_BOOTSTRAP_TOKEN environment variable is required")
+		os.Exit(1)
+	}
+
+	seedWooURL := os.Getenv("SEED_WOO_URL")
+	seedWooToken := os.Getenv("SEED_WOO_TOKEN")
+
+	// ── Cryptography ────────────────────────────────────────
+	encKey, err := crypto.ParseKey(encKeyStr)
+	if err != nil {
+		slog.Error("failed to parse GATEWAY_ENCRYPTION_KEY", "err", err)
+		os.Exit(1)
+	}
+	encryptor, err := crypto.NewGCMEncryptor(encKey)
+	if err != nil {
+		slog.Error("failed to initialize AES-256-GCM encryptor", "err", err)
+		os.Exit(1)
+	}
+
+	// ── Database Connection ─────────────────────────────────
+	dbCfg := db.Config{
+		Host:     pgHost,
+		Port:     pgPort,
+		User:     pgUser,
+		Password: pgPass,
+		Database: pgDB,
+		SSLMode:  envOr("POSTGRES_SSLMODE", "disable"),
+	}
+
+	// Connect with startup retry backoff (up to 30s) to allow DB pod to become ready
+	var poolErr error
+	var pool *db.Config
+	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
+	defer cancel()
+
+	pgxPool, poolErr := connectWithRetry(ctx, dbCfg)
+	if poolErr != nil {
+		slog.Error("failed to connect to PostgreSQL after retries", "err", poolErr)
+		os.Exit(1)
+	}
+	defer pgxPool.Close()
+	_ = pool
+
+	// ── Migrations ──────────────────────────────────────────
+	if err := db.Migrate(ctx, pgxPool); err != nil {
+		slog.Error("failed to run database migrations", "err", err)
+		os.Exit(1)
+	}
+
+	// ── Registry Repository & Handlers ──────────────────────
+	repo := registry.NewPostgresRepository(pgxPool, encryptor)
+
+	// Auto-seed woo-mcp if configured
+	if seedWooURL != "" {
+		if err := registry.SeedWooServer(ctx, repo, registry.SeedWooConfig{
+			URL:   seedWooURL,
+			Token: seedWooToken,
+		}); err != nil {
+			slog.Error("failed to auto-seed woo-mcp server", "err", err)
+			os.Exit(1)
+		}
+	}
+
+	// TEMPORARY: Bootstrap authenticator for Chunk 3. Chunk 4 will swap this for API keys & user sessions.
+	authenticator := auth.NewBootstrapAuthenticator(bootstrapToken)
+	authMiddleware := auth.Middleware(authenticator)
+
+	regHandler := registry.NewHandler(repo)
 
 	// ── HTTP mux ────────────────────────────────────────────
 	mux := http.NewServeMux()
 
-	// /healthz – liveness: if this fails Kubernetes restarts the pod.
-	// It returns 200 as long as the process is alive and the HTTP server
-	// is accepting connections.
+	// /healthz – liveness: process-only check
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	})
 
-	// /readyz – readiness: if this fails Kubernetes removes the pod from
-	// service endpoints. Later chunks will add checks for DB connectivity
-	// and upstream health.
-	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, _ *http.Request) {
+	// /readyz – readiness: checks database connectivity
+	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
+		pingCtx, pingCancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer pingCancel()
+
+		if err := pgxPool.Ping(pingCtx); err != nil {
+			slog.Warn("readyz check failed: DB ping error", "err", err)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"status":"unavailable","error":"database unreachable"}`))
+			return
+		}
+
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"status":"ready"}`))
 	})
+
+	// Mount protected registry API routes
+	apiMux := http.NewServeMux()
+	regHandler.RegisterRoutes(apiMux)
+	mux.Handle("/api/servers", authMiddleware(apiMux))
+	mux.Handle("/api/servers/", authMiddleware(apiMux))
 
 	// ── Server ──────────────────────────────────────────────
 	srv := &http.Server{
@@ -56,10 +153,7 @@ func main() {
 	}
 
 	// ── Graceful shutdown ───────────────────────────────────
-	// We listen for SIGINT (Ctrl-C) and SIGTERM (what Kubernetes sends on
-	// pod termination). On signal we give in-flight requests up to 15s to
-	// complete before forcing shutdown.
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	shutdownCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	go func() {
@@ -70,18 +164,43 @@ func main() {
 		}
 	}()
 
-	<-ctx.Done()
+	<-shutdownCtx.Done()
 	slog.Info("shutting down gracefully")
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	if err := srv.Shutdown(shutdownCtx); err != nil {
+	drainCtx, drainCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer drainCancel()
+	if err := srv.Shutdown(drainCtx); err != nil {
 		slog.Error("forced shutdown", "err", err)
 	}
 	slog.Info("gateway stopped")
 }
 
-// envOr returns the value of an environment variable or a fallback default.
+func connectWithRetry(ctx context.Context, cfg db.Config) (*pgxpool.Pool, error) {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		deadline = time.Now().Add(30 * time.Second)
+	}
+
+	for {
+		pool, err := db.NewPool(ctx, cfg)
+		if err == nil {
+			slog.Info("successfully connected to PostgreSQL")
+			return pool, nil
+		}
+
+		if time.Now().After(deadline) {
+			return nil, err
+		}
+
+		slog.Info("waiting for PostgreSQL to become ready...", "err", err)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(2 * time.Second):
+		}
+	}
+}
+
 func envOr(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v

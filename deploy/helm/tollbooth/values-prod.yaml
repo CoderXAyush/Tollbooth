@@ -59,6 +59,7 @@ ingress:
   className: nginx
   hosts:
     dashboard: dashboard.example.com
+    gateway: gateway.example.com
     api: api.example.com
     store: store.example.com
   tls:

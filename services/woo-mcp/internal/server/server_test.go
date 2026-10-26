@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/CoderXAyush/Tollbooth/services/woo-mcp/internal/client"
@@ -335,9 +336,9 @@ func TestListOrders(t *testing.T) {
 		if len(out) != 1 || out[0].ID != 14 {
 			t.Errorf("unexpected output: %+v", out)
 		}
-		// Confirm PII is NOT present in OrderSummary
+		// Confirm PII is NOT present in OrderSummary and date is RFC3339 with Z suffix
 		jsonBytes, _ := json.Marshal(out[0])
-		if string(jsonBytes) != `{"id":14,"status":"pending","total":"49.99","currency":"USD","date_created":"2026-10-25T07:14:25","payment_method_title":"Cash on delivery","line_items":[{"name":"Hoodie","quantity":1,"total":"49.99"}]}` {
+		if string(jsonBytes) != `{"id":14,"status":"pending","total":"49.99","currency":"USD","date_created_gmt":"2026-10-25T07:14:25Z","payment_method_title":"Cash on delivery","line_items":[{"name":"Hoodie","quantity":1,"total":"49.99"}]}` {
 			t.Errorf("order summary contains unexpected fields: %s", string(jsonBytes))
 		}
 	})
@@ -394,6 +395,9 @@ func TestGetOrder(t *testing.T) {
 		if res.IsError {
 			t.Fatalf("expected success, got error: %v", res.Content)
 		}
+		if out.DateCreatedGMT != "2026-10-25T07:14:25Z" {
+			t.Errorf("expected date_created_gmt with Z suffix, got: %s", out.DateCreatedGMT)
+		}
 		if out.Customer.FirstName != "Jane" || out.Customer.LastName != "Doe" || out.Customer.Email != "jane@example.com" {
 			t.Errorf("customer details wrong: %+v", out.Customer)
 		}
@@ -433,6 +437,9 @@ func TestUpdateOrderStatus(t *testing.T) {
 		if out.Status != "completed" || out.ID != 14 {
 			t.Errorf("unexpected output: %+v", out)
 		}
+		if out.DateModified != "2026-10-25T08:00:00Z" {
+			t.Errorf("expected RFC3339 with Z, got: %s", out.DateModified)
+		}
 	})
 
 	t.Run("Validation Failure: Invalid Status", func(t *testing.T) {
@@ -440,6 +447,16 @@ func TestUpdateOrderStatus(t *testing.T) {
 		res, _, _ := handler(ctx, nil, UpdateOrderStatusInput{ID: 14, Status: "bogus-status"})
 		if !res.IsError {
 			t.Fatal("expected IsError=true")
+		}
+	})
+
+	t.Run("Validation Failure: Disallowed Enum Values (trash and refunded)", func(t *testing.T) {
+		handler := handleUpdateOrderStatus(&mockWooClient{})
+		for _, disallowed := range []string{"trash", "refunded"} {
+			res, _, _ := handler(ctx, nil, UpdateOrderStatusInput{ID: 14, Status: disallowed})
+			if !res.IsError {
+				t.Fatalf("expected status %q to be rejected, got IsError=false", disallowed)
+			}
 		}
 	})
 
@@ -453,6 +470,84 @@ func TestUpdateOrderStatus(t *testing.T) {
 		res, _, _ := handler(ctx, nil, UpdateOrderStatusInput{ID: 14, Status: "completed"})
 		if !res.IsError {
 			t.Fatal("expected IsError=true")
+		}
+	})
+}
+
+func TestErrorSanitization(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("Network error does not leak URL, hostname, port, or IP", func(t *testing.T) {
+		mock := &mockWooClient{
+			listProductsFunc: func(_ context.Context, _ client.ListProductsFilter) ([]client.WooProduct, error) {
+				return nil, errors.New(`Get "http://store-wordpress.tollbooth.svc.cluster.local:80/wp-json/wc/v3/products": dial tcp 10.96.245.126:80: connect: connection refused`)
+			},
+		}
+
+		handler := handleListProducts(mock)
+		res, _, err := handler(ctx, nil, ListProductsInput{})
+		if err != nil {
+			t.Fatalf("unexpected go error: %v", err)
+		}
+		if !res.IsError {
+			t.Fatal("expected IsError=true")
+		}
+		if len(res.Content) == 0 {
+			t.Fatal("expected non-empty content")
+		}
+		textContent, ok := res.Content[0].(*mcp.TextContent)
+		if !ok {
+			t.Fatalf("expected TextContent, got: %T", res.Content[0])
+		}
+		msg := textContent.Text
+
+		forbidden := []string{
+			"10.96.245.126",
+			"store-wordpress",
+			"tollbooth.svc",
+			"cluster.local",
+			"http://",
+			":80",
+		}
+		for _, f := range forbidden {
+			if strings.Contains(msg, f) {
+				t.Fatalf("sanitized error leaked forbidden sensitive text %q: full msg: %q", f, msg)
+			}
+		}
+	})
+
+	t.Run("API error sanitizes Message containing IP or host", func(t *testing.T) {
+		mock := &mockWooClient{
+			getProductFunc: func(_ context.Context, _ int) (*client.WooProduct, error) {
+				return nil, &client.APIError{
+					StatusCode: 502,
+					Message:    "Failed upstream connection to 192.168.1.100:8000 via http://internal-server.local",
+				}
+			},
+		}
+
+		handler := handleGetProduct(mock)
+		res, _, err := handler(ctx, nil, GetProductInput{ID: 10})
+		if err != nil {
+			t.Fatalf("unexpected go error: %v", err)
+		}
+		if !res.IsError {
+			t.Fatal("expected IsError=true")
+		}
+		textContent, ok := res.Content[0].(*mcp.TextContent)
+		if !ok {
+			t.Fatalf("expected TextContent, got: %T", res.Content[0])
+		}
+		msg := textContent.Text
+
+		forbidden := []string{
+			"192.168.1.100",
+			"http://internal-server.local",
+		}
+		for _, f := range forbidden {
+			if strings.Contains(msg, f) {
+				t.Fatalf("API error leaked forbidden sensitive text %q: full msg: %q", f, msg)
+			}
 		}
 	})
 }

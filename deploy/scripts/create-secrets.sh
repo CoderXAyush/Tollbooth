@@ -90,4 +90,29 @@ else
   echo "  [+] Secret 'woo-mcp-auth' created in '${NAMESPACE}'"
 fi
 
+# 6. Gateway AES-256-GCM encryption key
+if kubectl get secret gateway-encryption-key -n "${NAMESPACE}" >/dev/null 2>&1; then
+  echo "  [✓] Secret 'gateway-encryption-key' already exists in '${NAMESPACE}'"
+else
+  # 32 random bytes (256-bit key) base64-encoded
+  ENC_KEY=$(openssl rand -base64 32)
+  kubectl create secret generic gateway-encryption-key \
+    --namespace="${NAMESPACE}" \
+    --from-literal=ENCRYPTION_KEY="${ENC_KEY}" \
+    --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+  echo "  [+] Secret 'gateway-encryption-key' created in '${NAMESPACE}'"
+fi
+
+# 7. Gateway temporary bootstrap token
+if kubectl get secret gateway-bootstrap-token -n "${NAMESPACE}" >/dev/null 2>&1; then
+  echo "  [✓] Secret 'gateway-bootstrap-token' already exists in '${NAMESPACE}'"
+else
+  BOOTSTRAP_TOKEN="tb_boot_$(openssl rand -hex 16)"
+  kubectl create secret generic gateway-bootstrap-token \
+    --namespace="${NAMESPACE}" \
+    --from-literal=BOOTSTRAP_TOKEN="${BOOTSTRAP_TOKEN}" \
+    --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+  echo "  [+] Secret 'gateway-bootstrap-token' created in '${NAMESPACE}'"
+fi
+
 echo "==> All required secrets are verified in '${NAMESPACE}'."

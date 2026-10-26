@@ -135,6 +135,7 @@ ingress:
   className: nginx
   hosts:
     dashboard: dashboard.127.0.0.1.nip.io
+    gateway: gateway.127.0.0.1.nip.io
     api: api.127.0.0.1.nip.io
     store: store.127.0.0.1.nip.io
   tls: []

@@ -431,6 +431,62 @@ The token is validated in `BearerAuthMiddleware` using `crypto/subtle.ConstantTi
 
 ---
 
+## 12. Gateway Core: Persistence, Registry, and Credential Security (Chunk 3 Part A)
+
+### PostgreSQL StatefulSet & Data Persistence
+- **Workload:** PostgreSQL 16 is deployed as a single-replica `StatefulSet` with dedicated `volumeClaimTemplates` (`postgres-data`, 1Gi local / 10Gi prod).
+- **Probes:**
+  - Liveness & Readiness: `pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"`.
+- **Security:** Runs with non-root security context (`runAsUser: 999`, `fsGroup: 999`).
+- **Network Isolation:** Ingress is strictly restricted via `postgres-netpol` to pods carrying `app.kubernetes.io/name: gateway` on TCP port 5432. All other pods (such as `woo-mcp` or `store-wordpress`) time out with exit code 28.
+
+### Embedded Migrations with Advisory Locks
+Database migrations are embedded into the Go binary (`//go:embed`) and executed at gateway startup via `db.Migrate`:
+- **Advisory Lock:** Before schema checks or execution, the gateway acquires a PostgreSQL session-level advisory lock (`SELECT pg_advisory_lock(742910381923)`). This ensures atomic, safe migrations even when multiple gateway replicas start up concurrently.
+- **Tracking:** A dedicated `schema_migrations` table records applied versions with timestamps.
+- **Scope:** Creates `mcp_servers` and `mcp_tools` tables with foreign keys and cascade rules.
+
+### AES-256-GCM Credential Security
+- **Encryption Algorithm:** AES-256-GCM authenticated encryption.
+- **Nonce Generation:** Every credential encryption operation generates a cryptographically secure, random 12-byte nonce (`crypto/rand`). Nonces are stored alongside ciphertext in `credential_nonce`.
+- **Tamper Detection:** GCM Poly1305 authentication tags are validated during decryption; tampered ciphertexts or nonces fail decryption with clear errors.
+- **Write-Only Principle:** Decrypted credentials exist in memory only during active upstream network calls. API responses, server models, and log messages **never** disclose credentials; responses only return `has_credential: true/false`.
+- **Key Rotation Gap:** Currently, encryption uses a static 256-bit key from `gateway-encryption-key` Secret. Rekeying/rotation across existing database rows is a documented gap to be addressed in post-MVP tooling.
+
+### Registry API & Validation
+- **Endpoints:** Protected by `auth.Middleware` behind the `Authenticator` interface:
+  - `POST /api/servers`: Register server with name, slug, URL, optional credential, timeout.
+  - `GET /api/servers`: List all servers with `tool_count` and `has_credential`.
+  - `GET /api/servers/{id}`: Retrieve server by UUID or slug.
+  - `PUT /api/servers/{id}`: Update server configuration, URL, enabled status, or credential.
+  - `DELETE /api/servers/{id}`: Remove server and cascade associated cached tools.
+  - `POST /api/servers/{id}/test`: Test connectivity to upstream MCP server via JSON-RPC `initialize`.
+- **Slug Validation:** Strictly matches `^[a-z0-9]([a-z0-9-]{0,18}[a-z0-9])?$` (1-20 characters, lowercase alphanumeric and hyphens, no underscores). This guarantees that splitting on the first `__` cleanly distinguishes the slug from the tool name.
+- **URL Validation:** Rejects non-HTTP(S) schemes or malformed hosts. Duplicate slugs return `409 Conflict`.
+
+### Temporary Authentication
+Chunk 3 implements a `BootstrapAuthenticator` satisfying the `Authenticator` interface. It verifies incoming `Authorization: Bearer <token>` against the Secret `gateway-bootstrap-token` using `crypto/subtle.ConstantTimeCompare`. This provides immediate security while keeping auth pluggable for Chunk 4's multi-user sessions, roles, and hashed API keys.
+
+### Idempotent Seeding
+On startup, the gateway checks for the existence of the default `woo` server in `mcp_servers`. If missing, it registers `woo` pointing to `SEED_WOO_URL` with the Bearer token from `SEED_WOO_TOKEN`. If `woo` already exists, seeding skips execution to avoid overwriting admin edits.
+
+### Ingress Streaming Configuration
+The Gateway ingress at `gateway.127.0.0.1.nip.io` applies critical NGINX annotations:
+```yaml
+nginx.ingress.kubernetes.io/proxy-buffering: "off"
+nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+```
+- **Why Proxy Buffering Off?** MCP uses Streamable HTTP / Server-Sent Events (SSE). Without `proxy-buffering: "off"`, NGINX buffers chunked responses until buffer thresholds are met or connections close, preventing real-time chunk streaming to LLM clients.
+- **Why Long Timeouts?** Large tool calls or long streaming conversations can exceed standard proxy timeouts (60s). 3600-second timeouts ensure long-running queries or interactive sessions are not prematurely terminated by the proxy.
+
+### NetworkPolicy & SSRF Considerations
+- **Gateway NetworkPolicy:** Gateway egress is locked down to CoreDNS (`kube-dns:53`), PostgreSQL (`postgres:5432`), and `woo-mcp:8081`.
+- **External Upstreams:** Admin-added external upstream servers require wider network egress, gated behind `networkPolicy.allowExternalEgress` in Helm values.
+- **SSRF Deferred:** Validating and firewalling user-supplied upstream URLs against internal infrastructure (AWS metadata endpoints, cluster IP ranges) is recorded in `THREAT_MODEL.md` and deferred to the hardening chunk.
+
+---
+
 ## Open Questions
 
 1. **Session store:** Should we use PostgreSQL for session storage or switch to Redis? PostgreSQL is simpler (fewer moving parts) but Redis handles TTL natively. Current decision: PostgreSQL, revisit if session volume becomes a concern.
@@ -442,3 +498,4 @@ The token is validated in `BearerAuthMiddleware` using `crypto/subtle.ConstantTi
 4. **Webhook support:** WooCommerce supports webhooks for real-time updates. Should woo-mcp expose a webhook receiver so tools can return fresher data? Defer to post-MVP.
 
 5. **Key rotation automation:** The KEK rotation process is manual (re-encrypt DEKs). Should we automate this with a CronJob? Defer.
+

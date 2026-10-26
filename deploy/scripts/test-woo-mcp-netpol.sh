@@ -59,19 +59,31 @@ else
   exit 1
 fi
 
-echo "==> [4/4] Testing blocked access to MariaDB:3306 from gateway/client..."
-set +e
-MARIADB_BLOCKED=$(kubectl run netpol-mariadb-client -n "${NAMESPACE}" \
-  --labels="app.kubernetes.io/name=gateway" \
-  --image=curlimages/curl --restart=Never --rm -i \
-  --command -- nc -z -w 3 store-mariadb 3306 2>&1)
-MARIADB_EXIT=$?
-set -e
+echo "==> [4/5] Testing blocked access to MariaDB:3306 from woo-mcp pod itself (asserting timeout)..."
+WOO_POD=$(kubectl get pod -n "${NAMESPACE}" -l app.kubernetes.io/name=woo-mcp,app.kubernetes.io/instance=woo-mcp -o jsonpath='{.items[0].metadata.name}')
 
-if [ ${MARIADB_EXIT} -ne 0 ]; then
-  echo "    [PASS] Direct MariaDB access from non-wordpress pod was BLOCKED (exit code: ${MARIADB_EXIT})."
+START_TS=$(date +%s)
+MARIADB_OUTPUT=$(kubectl debug -n "${NAMESPACE}" "${WOO_POD}" -i --image=curlimages/curl -- sh -c "curl -s --connect-timeout 3 http://store-mariadb:3306; echo 'EXIT:'\$?" 2>&1)
+END_TS=$(date +%s)
+DURATION=$((END_TS - START_TS))
+
+if echo "${MARIADB_OUTPUT}" | grep -q "EXIT:28"; then
+  echo "    [PASS] Direct MariaDB access from woo-mcp was BLOCKED with TIMEOUT (exit code: 28, duration: ${DURATION}s)."
 else
-  echo "    [FAIL] Direct MariaDB access was NOT blocked!"
+  echo "    [FAIL] Expected timeout exit code 28, got output: ${MARIADB_OUTPUT}"
+  exit 1
+fi
+
+echo "==> [5/5] Testing blocked access to internet from woo-mcp pod itself (asserting timeout)..."
+START_TS=$(date +%s)
+INTERNET_OUTPUT=$(kubectl debug -n "${NAMESPACE}" "${WOO_POD}" -i --image=curlimages/curl -- sh -c "curl -s --connect-timeout 3 http://1.1.1.1:80; echo 'EXIT:'\$?" 2>&1)
+END_TS=$(date +%s)
+DURATION=$((END_TS - START_TS))
+
+if echo "${INTERNET_OUTPUT}" | grep -q "EXIT:28"; then
+  echo "    [PASS] Internet access from woo-mcp was BLOCKED with TIMEOUT (exit code: 28, duration: ${DURATION}s)."
+else
+  echo "    [FAIL] Expected timeout exit code 28, got output: ${INTERNET_OUTPUT}"
   exit 1
 fi
 

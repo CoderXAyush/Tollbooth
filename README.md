@@ -9,7 +9,7 @@ A WooCommerce hosting platform with a team MCP (Model Context Protocol) gateway 
 | 0 | Foundations, contracts, repo scaffold | ✅ Done |
 | 1 | Cluster bootstrap, WordPress + WooCommerce deploy | ✅ Done |
 | 2 | woo-mcp server implementation | ✅ Done |
-| 3 | Gateway MCP aggregator + auth | 🔲 Not started |
+| 3 | Gateway core (aggregation, routing, failure isolation) | 🔄 Part A Done (`chunk-3a`), Part B in progress |
 | 4 | Dashboard UI | 🔲 Not started |
 | 5 | Chat agent | 🔲 Not started |
 | 6 | Production deployment (VPS/k3s) | 🔲 Not started |

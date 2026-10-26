@@ -109,3 +109,30 @@ This document identifies security-relevant design decisions and their rationale.
 - **`list_orders` Stripping:** The order listing tool completely omits customer names, email addresses, phone numbers, and delivery addresses. It returns only order ID, status, order totals, and product line items.
 - **`get_order` Minimization:** The order detail tool returns only minimal contact information (`first_name`, `last_name`, `email`) strictly necessary for order identification. Physical shipping/billing street addresses and telephone numbers are completely stripped before returning to the model.
 - **HTML Sanitization:** Product descriptions are stripped of raw HTML before serialization to avoid injecting misleading formatting into prompts.
+
+---
+
+## 9. SSRF Protection on Admin-Added Upstream URLs (Deferred to Hardening Chunk)
+
+**Threat:** When administrators register new upstream MCP servers via `POST /api/servers`, they provide arbitrary target URLs (e.g., `http://169.254.169.254/latest/meta-data/` or internal Kubernetes service endpoints). Without URL verification, the gateway could be coerced into making Server-Side Request Forgery (SSRF) requests to sensitive internal cluster services or cloud provider metadata endpoints.
+
+**Current Mitigations:**
+- The Gateway's default `NetworkPolicy` restricts egress to `kube-dns:53`, PostgreSQL (`postgres:5432`), and `woo-mcp:8081`. Outbound traffic to the wider internet or private CIDRs is blocked by default at the network layer.
+- Upstream URLs must parse with HTTP/HTTPS schemes and valid hosts.
+
+**Deferred Hardening:**
+- Comprehensive application-level SSRF defense—including pre-dial DNS resolution checks, blocking loopback/private/link-local IP addresses (RFC 1918, RFC 3927), and egress gateway proxies—is explicitly deferred to the platform hardening chunk.
+
+---
+
+## 10. Upstream Credential Encryption and Storage (AES-256-GCM)
+
+**Threat:** If the PostgreSQL database is backed up, dumped, or accessed by unauthorized cluster workloads, stored upstream credentials (Bearer tokens, API keys) could be compromised in plaintext.
+
+**Mitigations:**
+- All upstream credentials are encrypted using AES-256-GCM before database insertion.
+- A fresh, cryptographically random 12-byte nonce (`crypto/rand`) is generated for every encryption operation and stored in `credential_nonce`.
+- Poly1305 authentication tags are verified upon decryption to detect database record tampering or ciphertext truncation.
+- Credentials are strictly write-only: API responses never serialize encrypted or decrypted credentials, returning only a `has_credential: true/false` indicator.
+- Database access is restricted at the network layer by `postgres-netpol` exclusively to pods carrying `app.kubernetes.io/name: gateway`.
+

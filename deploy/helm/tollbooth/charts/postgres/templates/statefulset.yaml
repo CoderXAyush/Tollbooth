@@ -1,19 +1,17 @@
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
-  name: {{ .Release.Name }}-postgres
+  name: postgres
   labels:
     app.kubernetes.io/name: postgres
     app.kubernetes.io/instance: {{ .Release.Name }}
     app.kubernetes.io/component: database
 spec:
+  serviceName: postgres
   replicas: 1
-  strategy:
-    type: Recreate
   selector:
     matchLabels:
       app.kubernetes.io/name: postgres
-      app.kubernetes.io/instance: {{ .Release.Name }}
   template:
     metadata:
       labels:
@@ -28,7 +26,7 @@ spec:
       containers:
         - name: postgres
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
-          imagePullPolicy: {{ .Values.global.imagePullPolicy | default "IfNotPresent" }}
+          imagePullPolicy: {{ if .Values.global }}{{ .Values.global.imagePullPolicy | default "IfNotPresent" }}{{ else }}{{ .Values.imagePullPolicy | default "IfNotPresent" }}{{ end }}
           ports:
             - name: postgres
               containerPort: {{ .Values.port }}
@@ -37,26 +35,26 @@ spec:
             - name: POSTGRES_USER
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Release.Name }}-postgres-credentials
+                  name: {{ .Values.existingSecret | default "postgres-credentials" }}
                   key: POSTGRES_USER
             - name: POSTGRES_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Release.Name }}-postgres-credentials
+                  name: {{ .Values.existingSecret | default "postgres-credentials" }}
                   key: POSTGRES_PASSWORD
             - name: POSTGRES_DB
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Release.Name }}-postgres-credentials
+                  name: {{ .Values.existingSecret | default "postgres-credentials" }}
                   key: POSTGRES_DB
             - name: PGDATA
               value: /var/lib/postgresql/data/pgdata
           livenessProbe:
             exec:
               command:
-                - pg_isready
-                - -U
-                - $(POSTGRES_USER)
+                - /bin/sh
+                - -c
+                - exec pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"
             initialDelaySeconds: 15
             periodSeconds: 10
             timeoutSeconds: 5
@@ -64,9 +62,9 @@ spec:
           readinessProbe:
             exec:
               command:
-                - pg_isready
-                - -U
-                - $(POSTGRES_USER)
+                - /bin/sh
+                - -c
+                - exec pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"
             initialDelaySeconds: 5
             periodSeconds: 5
             timeoutSeconds: 3
@@ -81,7 +79,17 @@ spec:
           volumeMounts:
             - name: postgres-data
               mountPath: /var/lib/postgresql/data
-      volumes:
-        - name: postgres-data
-          persistentVolumeClaim:
-            claimName: {{ .Release.Name }}-postgres-data
+  volumeClaimTemplates:
+    - metadata:
+        name: postgres-data
+        labels:
+          app.kubernetes.io/name: postgres
+          app.kubernetes.io/instance: {{ .Release.Name }}
+      spec:
+        accessModes: [ "ReadWriteOnce" ]
+        {{- if .Values.storage.storageClass }}
+        storageClassName: {{ .Values.storage.storageClass }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.storage.size }}
