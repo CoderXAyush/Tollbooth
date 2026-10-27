@@ -55,6 +55,9 @@ spec:
             matchLabels:
               app.kubernetes.io/name: wordpress
               app.kubernetes.io/instance: {{ .Release.Name }}
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: bootstrap
       ports:
         - protocol: TCP
           port: {{ .Values.mariadb.port | default 3306 }}
