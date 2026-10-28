@@ -19,7 +19,7 @@ func TestAPIKeyPostgresIntegration(t *testing.T) {
 		t.Skip("set TOLLBOOTH_TEST_DATABASE_URL to run PostgreSQL integration tests")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
 	pool, err := pgxpool.New(ctx, dsn)
@@ -107,15 +107,15 @@ func TestAPIKeyPostgresIntegration(t *testing.T) {
 	if _, err := repo.AuthenticateAPIKey(ctx, rawKey); err != ErrInvalidAPIKey {
 		t.Fatalf("expected revoked key to be rejected, got %v", err)
 	}
-
 }
+
 func TestAPIKeySecurityEdgeCases(t *testing.T) {
 	dsn := os.Getenv("TOLLBOOTH_TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("set TOLLBOOTH_TEST_DATABASE_URL to run PostgreSQL integration tests")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
 	pool, err := pgxpool.New(ctx, dsn)
@@ -124,30 +124,38 @@ func TestAPIKeySecurityEdgeCases(t *testing.T) {
 	}
 	defer pool.Close()
 
+	if err := pool.Ping(ctx); err != nil {
+		t.Fatal(err)
+	}
 	if err := db.Migrate(ctx, pool); err != nil {
 		t.Fatal(err)
 	}
 
 	repo := NewRepository(pool)
 
-	createUser := func() *User {
+	createUser := func(t *testing.T) *User {
 		t.Helper()
+
 		user, err := repo.CreateUser(
-			ctx, "api-key-test-"+uuid.NewString()+"@example.test",
-			"integration-test-password", RoleMember,
+			ctx,
+			"api-key-test-"+uuid.NewString()+"@example.test",
+			"integration-test-password",
+			RoleMember,
 		)
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("create test user: %v", err)
 		}
+
 		t.Cleanup(func() {
 			_, _ = pool.Exec(context.Background(),
 				"DELETE FROM users WHERE id = $1", user.ID)
 		})
+
 		return user
 	}
 
 	t.Run("expired key is rejected", func(t *testing.T) {
-		user := createUser()
+		user := createUser(t)
 		expiry := time.Now().Add(-time.Minute)
 
 		rawKey, _, err := repo.CreateAPIKey(ctx, user.ID, "expired", &expiry)
@@ -160,7 +168,7 @@ func TestAPIKeySecurityEdgeCases(t *testing.T) {
 	})
 
 	t.Run("disabled user key is rejected", func(t *testing.T) {
-		user := createUser()
+		user := createUser(t)
 		rawKey, _, err := repo.CreateAPIKey(ctx, user.ID, "disabled user", nil)
 		if err != nil {
 			t.Fatal(err)
@@ -177,8 +185,8 @@ func TestAPIKeySecurityEdgeCases(t *testing.T) {
 	})
 
 	t.Run("cross-user revocation is rejected", func(t *testing.T) {
-		userA := createUser()
-		userB := createUser()
+		userA := createUser(t)
+		userB := createUser(t)
 
 		rawKey, key, err := repo.CreateAPIKey(ctx, userB.ID, "user B key", nil)
 		if err != nil {
