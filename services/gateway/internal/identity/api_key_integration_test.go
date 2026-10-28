@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/CoderXAyush/Tollbooth/services/gateway/internal/db"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -29,6 +30,10 @@ func TestAPIKeyPostgresIntegration(t *testing.T) {
 
 	if err := pool.Ping(ctx); err != nil {
 		t.Fatal(err)
+	}
+
+	if err := db.Migrate(ctx, pool); err != nil {
+		t.Fatalf("apply migrations: %v", err)
 	}
 
 	var tableExists bool
