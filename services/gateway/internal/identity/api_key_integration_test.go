@@ -107,4 +107,91 @@ func TestAPIKeyPostgresIntegration(t *testing.T) {
 	if _, err := repo.AuthenticateAPIKey(ctx, rawKey); err != ErrInvalidAPIKey {
 		t.Fatalf("expected revoked key to be rejected, got %v", err)
 	}
+
+}
+func TestAPIKeySecurityEdgeCases(t *testing.T) {
+	dsn := os.Getenv("TOLLBOOTH_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("set TOLLBOOTH_TEST_DATABASE_URL to run PostgreSQL integration tests")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+
+	if err := db.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+
+	repo := NewRepository(pool)
+
+	createUser := func() *User {
+		t.Helper()
+		user, err := repo.CreateUser(
+			ctx, "api-key-test-"+uuid.NewString()+"@example.test",
+			"integration-test-password", RoleMember,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			_, _ = pool.Exec(context.Background(),
+				"DELETE FROM users WHERE id = $1", user.ID)
+		})
+		return user
+	}
+
+	t.Run("expired key is rejected", func(t *testing.T) {
+		user := createUser()
+		expiry := time.Now().Add(-time.Minute)
+
+		rawKey, _, err := repo.CreateAPIKey(ctx, user.ID, "expired", &expiry)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := repo.AuthenticateAPIKey(ctx, rawKey); err != ErrInvalidAPIKey {
+			t.Fatalf("expected expired key rejection, got %v", err)
+		}
+	})
+
+	t.Run("disabled user key is rejected", func(t *testing.T) {
+		user := createUser()
+		rawKey, _, err := repo.CreateAPIKey(ctx, user.ID, "disabled user", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := pool.Exec(ctx,
+			"UPDATE users SET disabled = true WHERE id = $1", user.ID); err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := repo.AuthenticateAPIKey(ctx, rawKey); err != ErrInvalidAPIKey {
+			t.Fatalf("expected disabled user's key rejection, got %v", err)
+		}
+	})
+
+	t.Run("cross-user revocation is rejected", func(t *testing.T) {
+		userA := createUser()
+		userB := createUser()
+
+		rawKey, key, err := repo.CreateAPIKey(ctx, userB.ID, "user B key", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		err = repo.RevokeAPIKey(ctx, userA.ID, key.ID)
+		if err != ErrAPIKeyNotFound {
+			t.Fatalf("expected key not found for other user, got %v", err)
+		}
+
+		if _, err := repo.AuthenticateAPIKey(ctx, rawKey); err != nil {
+			t.Fatalf("user A's revocation attempt affected user B's key: %v", err)
+		}
+	})
 }
