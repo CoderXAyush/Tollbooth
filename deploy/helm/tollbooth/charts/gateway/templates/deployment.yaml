@@ -64,6 +64,16 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.encryptionKeySecret | default "gateway-encryption-key" }}
                   key: ENCRYPTION_KEY
+            - name: GATEWAY_ADMIN_EMAIL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.adminCredentialsSecret | default "gateway-admin-credentials" }}
+                  key: ADMIN_EMAIL
+            - name: GATEWAY_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.adminCredentialsSecret | default "gateway-admin-credentials" }}
+                  key: ADMIN_PASSWORD
             - name: GATEWAY_BOOTSTRAP_TOKEN
               valueFrom:
                 secretKeyRef:

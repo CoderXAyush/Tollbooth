@@ -1,90 +1,122 @@
 #!/usr/bin/env bash
-# test-woo-mcp-netpol.sh – Prove NetworkPolicy enforcement for woo-mcp in tollbooth namespace
-#
-# Verifies:
-# 1. Pods with label app.kubernetes.io/name=gateway CAN reach woo-mcp port 8081.
-# 2. Pods without gateway label CANNOT reach woo-mcp port 8081 (connection timeout).
-# 3. woo-mcp CAN reach store-wordpress port 80.
-# 4. woo-mcp CANNOT reach store-mariadb port 3306 (blocked by egress/mariadb ingress netpol).
+# Proves the deployed woo-mcp NetworkPolicy permits only required traffic.
+# No secret is decoded or placed in a local command line.
 
 set -euo pipefail
 
-NAMESPACE="tollbooth"
+NAMESPACE="${1:-tollbooth}"
+WOO_SERVICE="woo-mcp-woo-mcp"
+WORDPRESS_SERVICE="store-wordpress"
+MARIADB_SERVICE="store-mariadb"
 
-echo "==> [1/4] Testing allowed ingress from gateway-labeled pod to woo-mcp:8081..."
-ALLOWED_OUTPUT=$(kubectl run netpol-gateway-client -n "${NAMESPACE}" \
+delete_pod() {
+  kubectl delete pod "$1" -n "${NAMESPACE}" --ignore-not-found --wait=false >/dev/null
+}
+
+run_timeout_test() {
+  local name="$1"
+  local labels="$2"
+  local url="$3"
+
+  set +e
+  local output
+  output="$(kubectl run "${name}" -n "${NAMESPACE}" \
+    --labels="${labels}" \
+    --image=curlimages/curl:8.11.1 \
+    --restart=Never --rm -i \
+    --command -- curl -sS --connect-timeout 3 --max-time 3 "${url}" 2>&1)"
+  local status=$?
+  set -e
+
+  if [[ ${status} -ne 0 ]] && grep -qE 'timed out|Timeout|28' <<<"${output}"; then
+    echo "    [PASS] ${name} was blocked by timeout."
+    return 0
+  fi
+
+  echo "    [FAIL] ${name} was expected to time out; exit=${status}; output=${output}" >&2
+  return 1
+}
+
+echo "==> [1/5] Gateway-labelled pod can reach woo-mcp health endpoint..."
+allowed="$(kubectl run netpol-gateway-client -n "${NAMESPACE}" \
   --labels="app.kubernetes.io/name=gateway" \
-  --image=curlimages/curl --restart=Never --rm -i \
-  --command -- curl -s -o /dev/null -w "%{http_code}" --max-time 5 http://woo-mcp-woo-mcp:8081/healthz 2>&1)
+  --image=curlimages/curl:8.11.1 \
+  --restart=Never --rm -i \
+  --command -- curl -sS -o /dev/null -w '%{http_code}' --max-time 5 \
+  "http://${WOO_SERVICE}:8081/healthz" 2>&1)"
 
-if echo "${ALLOWED_OUTPUT}" | grep -q "200"; then
-  echo "    [PASS] Gateway-labeled pod reached woo-mcp successfully (HTTP 200)."
+if grep -q '200' <<<"${allowed}"; then
+  echo "    [PASS] Gateway-labelled pod reached woo-mcp."
 else
-  echo "    [FAIL] Expected HTTP 200, got: '${ALLOWED_OUTPUT}'"
+  echo "    [FAIL] Expected HTTP 200; got: ${allowed}" >&2
   exit 1
 fi
 
-echo "==> [2/4] Testing blocked ingress from non-gateway pod to woo-mcp:8081..."
-set +e
-BLOCKED_OUTPUT=$(kubectl run netpol-unauth-client -n "${NAMESPACE}" \
-  --labels="app.kubernetes.io/name=unauthorized" \
-  --image=curlimages/curl --restart=Never --rm -i \
-  --command -- curl -s --max-time 3 http://woo-mcp-woo-mcp:8081/healthz 2>&1)
-EXIT_CODE=$?
-set -e
+echo "==> [2/5] Non-gateway pod cannot reach woo-mcp..."
+run_timeout_test \
+  "netpol-unauth-client" \
+  "app.kubernetes.io/name=unauthorized" \
+  "http://${WOO_SERVICE}:8081/healthz"
 
-if [ ${EXIT_CODE} -ne 0 ]; then
-  echo "    [PASS] Unauthorized pod was BLOCKED as expected (exit code: ${EXIT_CODE})."
-else
-  echo "    [FAIL] Unauthorized pod was NOT blocked! Output: ${BLOCKED_OUTPUT}"
+echo "==> [3/5] woo-mcp identity can call the store without exposing its bearer token..."
+cat <<'EOF' | kubectl apply -n "${NAMESPACE}" -f - >/dev/null
+apiVersion: v1
+kind: Pod
+metadata:
+  name: netpol-woo-store-client
+  labels:
+    app.kubernetes.io/name: gateway
+spec:
+  restartPolicy: Never
+  containers:
+    - name: client
+      image: curlimages/curl:8.11.1
+      env:
+        - name: MCP_AUTH_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: woo-mcp-auth
+              key: MCP_AUTH_TOKEN
+      command:
+        - /bin/sh
+        - -ec
+        - |
+          curl -sS --max-time 10 \
+            -X POST \
+            -H "Authorization: Bearer ${MCP_AUTH_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -H "Accept: application/json, text/event-stream" \
+            -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_products","arguments":{"per_page":1}}}' \
+            "http://woo-mcp-woo-mcp:8081/mcp"
+EOF
+
+if ! kubectl wait -n "${NAMESPACE}" --for=jsonpath='{.status.phase}'=Succeeded \
+  pod/netpol-woo-store-client --timeout=30s >/dev/null; then
+  kubectl logs -n "${NAMESPACE}" netpol-woo-store-client >&2 || true
+  delete_pod netpol-woo-store-client
+  echo "    [FAIL] Store-call pod did not complete." >&2
   exit 1
 fi
 
-echo "==> [3/4] Testing woo-mcp pod egress to store-wordpress:80 (via /mcp tool call)..."
-# We verify egress by calling list_products via the gateway client. If egress were blocked, it would fail.
-EGRESS_OUTPUT=$(kubectl run netpol-gateway-client -n "${NAMESPACE}" \
-  --labels="app.kubernetes.io/name=gateway" \
-  --image=curlimages/curl --restart=Never --rm -i \
-  --command -- curl -s -X POST \
-  -H "Authorization: Bearer $(kubectl get secret woo-mcp-auth -n ${NAMESPACE} -o jsonpath='{.data.MCP_AUTH_TOKEN}' | base64 -d)" \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_products","arguments":{}}}' \
-  http://woo-mcp-woo-mcp:8081/mcp 2>&1)
+store_call="$(kubectl logs -n "${NAMESPACE}" netpol-woo-store-client)"
+delete_pod netpol-woo-store-client
 
-if echo "${EGRESS_OUTPUT}" | grep -q "Tollbooth Hoodie"; then
-  echo "    [PASS] woo-mcp successfully reached WordPress store (received product catalog)."
-else
-  echo "    [FAIL] Store egress failed! Output: ${EGRESS_OUTPUT}"
+if grep -q '"isError":true' <<<"${store_call}" || ! grep -q 'Tollbooth Hoodie' <<<"${store_call}"; then
+  echo "    [FAIL] woo-mcp could not retrieve the product catalog." >&2
   exit 1
 fi
+echo "    [PASS] woo-mcp reached WordPress through its allowed egress rule."
 
-echo "==> [4/5] Testing blocked access to MariaDB:3306 from woo-mcp pod itself (asserting timeout)..."
-WOO_POD=$(kubectl get pod -n "${NAMESPACE}" -l app.kubernetes.io/name=woo-mcp,app.kubernetes.io/instance=woo-mcp -o jsonpath='{.items[0].metadata.name}')
+echo "==> [4/5] MariaDB rejects a non-WordPress/non-bootstrap pod by timeout..."
+run_timeout_test \
+  "netpol-mariadb-client" \
+  "app.kubernetes.io/name=woo-mcp,app.kubernetes.io/instance=woo-mcp" \
+  "http://${MARIADB_SERVICE}:3306"
 
-START_TS=$(date +%s)
-MARIADB_OUTPUT=$(kubectl debug -n "${NAMESPACE}" "${WOO_POD}" -i --image=curlimages/curl -- sh -c "curl -s --connect-timeout 3 http://store-mariadb:3306; echo 'EXIT:'\$?" 2>&1)
-END_TS=$(date +%s)
-DURATION=$((END_TS - START_TS))
+echo "==> [5/5] woo-mcp identity cannot reach the public internet..."
+run_timeout_test \
+  "netpol-internet-client" \
+  "app.kubernetes.io/name=woo-mcp,app.kubernetes.io/instance=woo-mcp" \
+  "http://1.1.1.1:80"
 
-if echo "${MARIADB_OUTPUT}" | grep -q "EXIT:28"; then
-  echo "    [PASS] Direct MariaDB access from woo-mcp was BLOCKED with TIMEOUT (exit code: 28, duration: ${DURATION}s)."
-else
-  echo "    [FAIL] Expected timeout exit code 28, got output: ${MARIADB_OUTPUT}"
-  exit 1
-fi
-
-echo "==> [5/5] Testing blocked access to internet from woo-mcp pod itself (asserting timeout)..."
-START_TS=$(date +%s)
-INTERNET_OUTPUT=$(kubectl debug -n "${NAMESPACE}" "${WOO_POD}" -i --image=curlimages/curl -- sh -c "curl -s --connect-timeout 3 http://1.1.1.1:80; echo 'EXIT:'\$?" 2>&1)
-END_TS=$(date +%s)
-DURATION=$((END_TS - START_TS))
-
-if echo "${INTERNET_OUTPUT}" | grep -q "EXIT:28"; then
-  echo "    [PASS] Internet access from woo-mcp was BLOCKED with TIMEOUT (exit code: 28, duration: ${DURATION}s)."
-else
-  echo "    [FAIL] Expected timeout exit code 28, got output: ${INTERNET_OUTPUT}"
-  exit 1
-fi
-
-echo "==> All woo-mcp NetworkPolicy tests PASSED!"
+echo "==> All woo-mcp NetworkPolicy checks passed."

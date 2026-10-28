@@ -1,7 +1,9 @@
 replicaCount: 1
+
 image:
   repository: tollbooth/gateway
   tag: dev
+
 port: 8080
 
 postgres:
@@ -10,6 +12,7 @@ postgres:
   existingSecret: "postgres-credentials"
 
 encryptionKeySecret: "gateway-encryption-key"
+adminCredentialsSecret: "gateway-admin-credentials"
 bootstrapTokenSecret: "gateway-bootstrap-token"
 wooAuthSecret: "woo-mcp-auth"
 

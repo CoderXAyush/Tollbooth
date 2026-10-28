@@ -14,6 +14,7 @@ import (
 	"github.com/CoderXAyush/Tollbooth/services/gateway/internal/auth"
 	"github.com/CoderXAyush/Tollbooth/services/gateway/internal/crypto"
 	"github.com/CoderXAyush/Tollbooth/services/gateway/internal/db"
+	"github.com/CoderXAyush/Tollbooth/services/gateway/internal/identity"
 	"github.com/CoderXAyush/Tollbooth/services/gateway/internal/mcpendpoint"
 	"github.com/CoderXAyush/Tollbooth/services/gateway/internal/registry"
 	"github.com/CoderXAyush/Tollbooth/services/gateway/internal/upstream"
@@ -21,11 +22,9 @@ import (
 )
 
 func main() {
-	// ── Logger ──────────────────────────────────────────────
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
 
-	// ── Configuration from environment ──────────────────────
 	port := envOr("PORT", "8080")
 	pgHost := envOr("POSTGRES_HOST", "postgres")
 	pgPort := envOr("POSTGRES_PORT", "5432")
@@ -39,6 +38,14 @@ func main() {
 		os.Exit(1)
 	}
 
+	adminEmail := os.Getenv("GATEWAY_ADMIN_EMAIL")
+	adminPassword := os.Getenv("GATEWAY_ADMIN_PASSWORD")
+	if adminEmail == "" || adminPassword == "" {
+		slog.Error("GATEWAY_ADMIN_EMAIL and GATEWAY_ADMIN_PASSWORD are required")
+		os.Exit(1)
+	}
+
+	// Temporary until Stage 4b replaces /mcp authentication with API keys.
 	bootstrapToken := os.Getenv("GATEWAY_BOOTSTRAP_TOKEN")
 	if bootstrapToken == "" {
 		slog.Error("GATEWAY_BOOTSTRAP_TOKEN environment variable is required")
@@ -48,7 +55,6 @@ func main() {
 	seedWooURL := os.Getenv("SEED_WOO_URL")
 	seedWooToken := os.Getenv("SEED_WOO_TOKEN")
 
-	// ── Cryptography ────────────────────────────────────────
 	encKey, err := crypto.ParseKey(encKeyStr)
 	if err != nil {
 		slog.Error("failed to parse GATEWAY_ENCRYPTION_KEY", "err", err)
@@ -60,7 +66,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// ── Database Connection ─────────────────────────────────
 	dbCfg := db.Config{
 		Host:     pgHost,
 		Port:     pgPort,
@@ -70,102 +75,68 @@ func main() {
 		SSLMode:  envOr("POSTGRES_SSLMODE", "disable"),
 	}
 
-	// Connect with startup retry backoff (up to 30s) to allow DB pod to become ready
-	var poolErr error
-	var pool *db.Config
 	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
 	defer cancel()
 
-	pgxPool, poolErr := connectWithRetry(ctx, dbCfg)
-	if poolErr != nil {
-		slog.Error("failed to connect to PostgreSQL after retries", "err", poolErr)
+	pgxPool, err := connectWithRetry(ctx, dbCfg)
+	if err != nil {
+		slog.Error("failed to connect to PostgreSQL after retries", "err", err)
 		os.Exit(1)
 	}
 	defer pgxPool.Close()
-	_ = pool
 
-	// ── Migrations ──────────────────────────────────────────
 	if err := db.Migrate(ctx, pgxPool); err != nil {
 		slog.Error("failed to run database migrations", "err", err)
 		os.Exit(1)
 	}
 
-	// ── Registry Repository & Handlers ──────────────────────
-	repo := registry.NewPostgresRepository(pgxPool, encryptor)
+	identityRepo := identity.NewRepository(pgxPool)
+	if err := identityRepo.SeedAdmin(ctx, adminEmail, adminPassword); err != nil {
+		slog.Error("failed to seed first administrator", "err", err)
+		os.Exit(1)
+	}
 
-	// Auto-seed woo-mcp if configured
+	repo := registry.NewPostgresRepository(pgxPool, encryptor)
 	if seedWooURL != "" {
 		if err := registry.SeedWooServer(ctx, repo, registry.SeedWooConfig{
-			URL:   seedWooURL,
-			Token: seedWooToken,
+			URL: seedWooURL, Token: seedWooToken,
 		}); err != nil {
 			slog.Error("failed to auto-seed woo-mcp server", "err", err)
 			os.Exit(1)
 		}
 	}
 
-	// TEMPORARY: Bootstrap authenticator for Chunk 3. Chunk 4 will swap this for API keys & user sessions.
-	authenticator := auth.NewBootstrapAuthenticator(bootstrapToken)
-	authMiddleware := auth.Middleware(authenticator)
-
-	regHandler := registry.NewHandler(repo)
-
-	// ── Upstream Manager & Tools Cache ───────────────────────
 	toolsRepo := upstream.NewPostgresToolsRepository(pgxPool)
-	callRecorder := upstream.NewSlogCallRecorder(logger)
-
 	upstreamMgr := upstream.NewManager(upstream.ManagerOptions{
-		Repo:      repo,
-		ToolsRepo: toolsRepo,
-		Recorder:  callRecorder,
+		Repo: repo, ToolsRepo: toolsRepo, Recorder: upstream.NewSlogCallRecorder(logger),
 	})
-
 	if err := upstreamMgr.Start(ctx); err != nil {
 		slog.Warn("upstream manager start encountered issues", "err", err)
 	}
 	defer upstreamMgr.Stop()
 
-	// ── MCP Endpoint Handler ────────────────────────────────
-	mcpHandler := mcpendpoint.NewHandler(upstreamMgr)
+	sessionHandler := auth.NewSessionHandler(identityRepo)
+	sessionMiddleware := auth.Middleware(auth.NewSessionAuthenticator(identityRepo))
+	bootstrapMiddleware := auth.Middleware(auth.NewBootstrapAuthenticator(bootstrapToken))
 
-	// ── HTTP mux ────────────────────────────────────────────
+	registryHandler := registry.NewHandler(repo)
+	registryMux := http.NewServeMux()
+	registryHandler.RegisterRoutes(registryMux)
+
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", healthHandler)
+	mux.HandleFunc("GET /readyz", readyHandler(pgxPool))
 
-	// /healthz – liveness: process-only check
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"status":"ok"}`))
-	})
+	// Dashboard API: session tokens only.
+	mux.HandleFunc("POST /api/auth/login", sessionHandler.Login)
+	mux.Handle("POST /api/auth/logout", sessionMiddleware(http.HandlerFunc(sessionHandler.Logout)))
+	mux.Handle("GET /api/me", sessionMiddleware(http.HandlerFunc(sessionHandler.Me)))
+	mux.Handle("/api/servers", sessionMiddleware(registryMux))
+	mux.Handle("/api/servers/", sessionMiddleware(registryMux))
 
-	// /readyz – readiness: checks database connectivity
-	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
-		pingCtx, pingCancel := context.WithTimeout(r.Context(), 2*time.Second)
-		defer pingCancel()
+	// External MCP API: temporary bootstrap token until Stage 4b API-key auth.
+	mux.Handle("/mcp", bootstrapMiddleware(mcpendpoint.NewHandler(upstreamMgr)))
 
-		if err := pgxPool.Ping(pingCtx); err != nil {
-			slog.Warn("readyz check failed: DB ping error", "err", err)
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusServiceUnavailable)
-			_, _ = w.Write([]byte(`{"status":"unavailable","error":"database unreachable"}`))
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"status":"ready"}`))
-	})
-
-	// Mount protected registry API routes
-	apiMux := http.NewServeMux()
-	regHandler.RegisterRoutes(apiMux)
-	mux.Handle("/api/servers", authMiddleware(apiMux))
-	mux.Handle("/api/servers/", authMiddleware(apiMux))
-
-	// Mount protected MCP endpoint at /mcp
-	mux.Handle("/mcp", authMiddleware(mcpHandler))
-
-	// ── Server ──────────────────────────────────────────────
 	srv := &http.Server{
 		Addr:              ":" + port,
 		Handler:           mux,
@@ -175,14 +146,13 @@ func main() {
 		IdleTimeout:       120 * time.Second,
 	}
 
-	// ── Graceful shutdown ───────────────────────────────────
 	shutdownCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	go func() {
 		slog.Info("gateway starting", "port", port)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			slog.Error("listen error", "err", err)
+			slog.Error("gateway listen error", "err", err)
 			os.Exit(1)
 		}
 	}()
@@ -195,7 +165,27 @@ func main() {
 	if err := srv.Shutdown(drainCtx); err != nil {
 		slog.Error("forced shutdown", "err", err)
 	}
-	slog.Info("gateway stopped")
+}
+
+func healthHandler(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write([]byte(`{"status":"ok"}`))
+}
+
+func readyHandler(pool *pgxpool.Pool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+
+		if err := pool.Ping(ctx); err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"status":"unavailable","error":"database unreachable"}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ready"}`))
+	}
 }
 
 func connectWithRetry(ctx context.Context, cfg db.Config) (*pgxpool.Pool, error) {
@@ -207,15 +197,13 @@ func connectWithRetry(ctx context.Context, cfg db.Config) (*pgxpool.Pool, error)
 	for {
 		pool, err := db.NewPool(ctx, cfg)
 		if err == nil {
-			slog.Info("successfully connected to PostgreSQL")
 			return pool, nil
 		}
-
 		if time.Now().After(deadline) {
 			return nil, err
 		}
 
-		slog.Info("waiting for PostgreSQL to become ready...", "err", err)
+		slog.Info("waiting for PostgreSQL to become ready", "err", err)
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
@@ -225,8 +213,8 @@ func connectWithRetry(ctx context.Context, cfg db.Config) (*pgxpool.Pool, error)
 }
 
 func envOr(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
+	if value := os.Getenv(key); value != "" {
+		return value
 	}
 	return fallback
 }
