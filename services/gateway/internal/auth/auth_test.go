@@ -149,3 +149,31 @@ func TestAdminOnly(t *testing.T) {
 		})
 	}
 }
+
+func TestAPIKeyAuthenticatorRejectsMissingOrMalformedBearerToken(t *testing.T) {
+	authenticator := NewAPIKeyAuthenticator(nil)
+
+	tests := []struct {
+		name   string
+		header string
+	}{
+		{name: "missing header", header: ""},
+		{name: "basic authentication", header: "Basic dXNlcjpwYXNz"},
+		{name: "missing token", header: "Bearer"},
+		{name: "empty token", header: "Bearer "},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/mcp", nil)
+			if tt.header != "" {
+				req.Header.Set("Authorization", tt.header)
+			}
+
+			_, err := authenticator.Authenticate(context.Background(), req)
+			if err == nil {
+				t.Fatal("expected authentication error")
+			}
+		})
+	}
+}

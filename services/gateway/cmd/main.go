@@ -45,12 +45,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Temporary until Stage 4b replaces /mcp authentication with API keys.
-	bootstrapToken := os.Getenv("GATEWAY_BOOTSTRAP_TOKEN")
-	if bootstrapToken == "" {
-		slog.Error("GATEWAY_BOOTSTRAP_TOKEN environment variable is required")
-		os.Exit(1)
-	}
+	// // Temporary until Stage 4b replaces /mcp authentication with API keys.
+	// bootstrapToken := os.Getenv("GATEWAY_BOOTSTRAP_TOKEN")
+	// if bootstrapToken == "" {
+	// 	slog.Error("GATEWAY_BOOTSTRAP_TOKEN environment variable is required")
+	// 	os.Exit(1)
+	// }
 
 	seedWooURL := os.Getenv("SEED_WOO_URL")
 	seedWooToken := os.Getenv("SEED_WOO_TOKEN")
@@ -117,7 +117,7 @@ func main() {
 
 	sessionHandler := auth.NewSessionHandler(identityRepo)
 	sessionMiddleware := auth.Middleware(auth.NewSessionAuthenticator(identityRepo))
-	bootstrapMiddleware := auth.Middleware(auth.NewBootstrapAuthenticator(bootstrapToken))
+	apiKeyMiddleware := auth.Middleware(auth.NewAPIKeyAuthenticator(identityRepo))
 
 	registryHandler := registry.NewHandler(repo)
 	registryMux := http.NewServeMux()
@@ -134,8 +134,15 @@ func main() {
 	mux.Handle("/api/servers", sessionMiddleware(auth.AdminOnly(registryMux)))
 	mux.Handle("/api/servers/", sessionMiddleware(auth.AdminOnly(registryMux)))
 
-	// External MCP API: temporary bootstrap token until Stage 4b API-key auth.
-	mux.Handle("/mcp", bootstrapMiddleware(mcpendpoint.NewHandler(upstreamMgr)))
+	// API-key management: dashboard sessions only.
+	apiKeyHandler := auth.NewAPIKeyHandler(identityRepo)
+
+	mux.Handle("POST /api/keys", sessionMiddleware(http.HandlerFunc(apiKeyHandler.Create)))
+	mux.Handle("GET /api/keys", sessionMiddleware(http.HandlerFunc(apiKeyHandler.List)))
+	mux.Handle("DELETE /api/keys/{id}", sessionMiddleware(http.HandlerFunc(apiKeyHandler.Revoke)))
+
+	// External MCP API: authenticated using user API keys.
+	mux.Handle("/mcp", apiKeyMiddleware(mcpendpoint.NewHandler(upstreamMgr)))
 
 	srv := &http.Server{
 		Addr:              ":" + port,

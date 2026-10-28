@@ -79,6 +79,38 @@ func (a *SessionAuthenticator) Authenticate(ctx context.Context, r *http.Request
 	}, nil
 }
 
+type APIKeyAuthenticator struct {
+	repo *identity.Repository
+}
+
+func NewAPIKeyAuthenticator(repo *identity.Repository) *APIKeyAuthenticator {
+	return &APIKeyAuthenticator{repo: repo}
+}
+
+func (a *APIKeyAuthenticator) Authenticate(
+	ctx context.Context,
+	r *http.Request,
+) (*Identity, error) {
+	token, ok := bearerToken(r)
+	if !ok {
+		return nil, ErrUnauthorized
+	}
+
+	user, err := a.repo.AuthenticateAPIKey(ctx, token)
+	if err != nil {
+		return nil, ErrUnauthorized
+	}
+
+	return &Identity{
+		ID:       user.ID.String(),
+		UserID:   user.ID,
+		Email:    user.Email,
+		Role:     user.Role,
+		Client:   "api-key",
+		IsBearer: true,
+	}, nil
+}
+
 func bearerToken(r *http.Request) (string, bool) {
 	parts := strings.Fields(r.Header.Get("Authorization"))
 	if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") || parts[1] == "" {

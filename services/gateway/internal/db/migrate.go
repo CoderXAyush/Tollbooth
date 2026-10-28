@@ -17,6 +17,9 @@ var migrationChunk3Up string
 //go:embed 000002_create_identity_tables.up.sql
 var migrationIdentityUp string
 
+//go:embed 000003_create_api_keys.up.sql
+var migrationApiKeysUp string
+
 const AdvisoryLockID int64 = 742910381923
 
 type migration struct {
@@ -28,6 +31,7 @@ type migration struct {
 var migrations = []migration{
 	{version: 1, name: "000001_create_chunk3_tables.up.sql", sql: migrationChunk3Up},
 	{version: 2, name: "000002_create_identity_tables.up.sql", sql: migrationIdentityUp},
+	{version: 3, name: "000003_create_api_keys.up.sql", sql: migrationApiKeysUp},
 }
 
 // Migrate applies embedded migrations once, in version order, under one advisory lock.
