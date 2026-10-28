@@ -10,7 +10,7 @@ A WooCommerce hosting platform with a team MCP (Model Context Protocol) gateway 
 | 1 | Cluster bootstrap, WordPress + WooCommerce deploy | ✅ Done |
 | 2 | woo-mcp server implementation | ✅ Done |
 | 3 | Gateway core (aggregation, routing, failure isolation) | ✅ Done (`chunk-3`) |
-| 4 | Users, roles, API keys, audit log | 🔲 Not started |
+| 4 | Users, roles, sessions, API keys, audit log | 🟡 In progress (Stage 4a: session auth and admin access) |
 | 5 | Dashboard UI | 🔲 Not started |
 | 6 | Chat agent | 🔲 Not started |
 | 7 | Production deployment (VPS/k3s) | 🔲 Not started |
@@ -445,6 +445,46 @@ curl -s -X PUT -H "Authorization: Bearer ${BOOTSTRAP_TOKEN}" \
    - *Cause:* Ingress NGINX buffers proxy responses by default.
    - *Fix:* Added `nginx.ingress.kubernetes.io/proxy-buffering: "off"` and extended read timeouts to 3600 seconds.
 
+## Gateway Authentication (Chunk 4a)
+
+The gateway supports session-based authentication and administrator authorization.
+
+### Authentication endpoints
+
+| Method | Endpoint | Purpose |
+|---|---|---|
+| `POST` | `/api/auth/login` | Authenticate with email and password |
+| `POST` | `/api/auth/logout` | Revoke the current session |
+| `GET` | `/api/me` | Return the current authenticated identity |
+
+### Authorization
+
+The `/api/servers` endpoints require an authenticated administrator.
+
+- `401 Unauthorized`: missing or invalid authentication.
+- `403 Forbidden`: authenticated user lacks administrator privileges.
+
+### Security controls
+
+- Password verification uses bcrypt with cost 12.
+- Login attempts are limited to 10 per IP address per minute.
+- Invalid credentials receive a generic error response.
+- Unknown-user attempts perform a dummy bcrypt comparison.
+- Database lookup failures return an internal error.
+- User identities and sessions are stored in PostgreSQL.
+
+### Database migrations and tests
+
+Identity and session tables are managed by migration
+`000002_create_identity_tables.up.sql`. Gateway tables for Chunk 3 are managed
+by `000001_create_chunk3_tables.up.sql`.
+
+Run validation from `services/gateway`:
+
+```bash
+go test ./...
+go test -race ./...
+go vet ./...
 ---
 
 ## How to Connect an External MCP Client

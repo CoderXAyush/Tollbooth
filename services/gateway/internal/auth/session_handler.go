@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"strings"
@@ -16,6 +17,7 @@ import (
 )
 
 const sessionLifetime = 24 * time.Hour
+const dummyPasswordHash = "$2a$12$K5s7jy4BJWpzs.XYfpAWMOdku07e0knIApPyMb37uFqjwCyxPdplm"
 
 type loginAttempt struct {
 	count       int
@@ -62,7 +64,18 @@ func (h *SessionHandler) Login(w http.ResponseWriter, r *http.Request) {
 	}
 
 	user, err := h.repo.FindUserByEmail(r.Context(), request.Email)
-	if err != nil || user.Disabled ||
+	if err != nil {
+		if errors.Is(err, identity.ErrUserNotFound) {
+			_ = bcrypt.CompareHashAndPassword([]byte(dummyPasswordHash), []byte(request.Password))
+			writeSessionError(w, http.StatusUnauthorized, "INVALID_CREDENTIALS", "invalid email or password")
+			return
+		}
+
+		writeSessionError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "internal server error")
+		return
+	}
+
+	if user.Disabled ||
 		bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(request.Password)) != nil {
 		writeSessionError(w, http.StatusUnauthorized, "INVALID_CREDENTIALS", "invalid email or password")
 		return
