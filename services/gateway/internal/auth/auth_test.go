@@ -177,3 +177,34 @@ func TestAPIKeyAuthenticatorRejectsMissingOrMalformedBearerToken(t *testing.T) {
 		})
 	}
 }
+
+func TestAuthMiddlewareRejectsMalformedBearerHeaders(t *testing.T) {
+	authenticator := NewAPIKeyAuthenticator(nil)
+	handler := Middleware(authenticator)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("handler must not run for invalid credentials")
+	}))
+
+	headers := []string{
+		"",
+		"Basic abc123",
+		"Bearer",
+		"Bearer ",
+		"Bearer one two",
+	}
+
+	for _, header := range headers {
+		t.Run(header, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/mcp", nil)
+			if header != "" {
+				req.Header.Set("Authorization", header)
+			}
+
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusUnauthorized {
+				t.Fatalf("expected 401, got %d", rec.Code)
+			}
+		})
+	}
+}
