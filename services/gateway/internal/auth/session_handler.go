@@ -120,14 +120,24 @@ func (h *SessionHandler) allowAttempt(ip string) bool {
 	defer h.mu.Unlock()
 
 	now := h.now()
-	attempt := h.attempts[ip]
-	if attempt.windowStart.IsZero() || now.Sub(attempt.windowStart) >= time.Minute {
+
+	// Remove expired entries to prevent unbounded map growth.
+	for addr, attempt := range h.attempts {
+		if now.Sub(attempt.windowStart) >= time.Minute {
+			delete(h.attempts, addr)
+		}
+	}
+
+	attempt, exists := h.attempts[ip]
+	if !exists {
 		attempt = loginAttempt{windowStart: now}
 	}
+
 	if attempt.count >= 10 {
 		h.attempts[ip] = attempt
 		return false
 	}
+
 	attempt.count++
 	h.attempts[ip] = attempt
 	return true

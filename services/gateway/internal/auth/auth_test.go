@@ -90,3 +90,62 @@ func TestAuthMiddleware(t *testing.T) {
 		}
 	})
 }
+
+func TestAdminOnly(t *testing.T) {
+	tests := []struct {
+		name       string
+		identity   *Identity
+		wantStatus int
+	}{
+		{
+			name:       "Unauthenticated request",
+			identity:   nil,
+			wantStatus: http.StatusUnauthorized,
+		},
+		{
+			name: "Member is forbidden",
+			identity: &Identity{
+				Role: "member",
+			},
+			wantStatus: http.StatusForbidden,
+		},
+		{
+			name: "Admin is allowed",
+			identity: &Identity{
+				Role: "admin",
+			},
+			wantStatus: http.StatusOK,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			called := false
+
+			next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				called = true
+				w.WriteHeader(http.StatusOK)
+			})
+
+			handler := AdminOnly(next)
+			req := httptest.NewRequest(http.MethodGet, "/api/servers", nil)
+
+			if tt.identity != nil {
+				ctx := context.WithValue(req.Context(), contextKey{}, tt.identity)
+				req = req.WithContext(ctx)
+			}
+
+			rr := httptest.NewRecorder()
+			handler.ServeHTTP(rr, req)
+
+			if rr.Code != tt.wantStatus {
+				t.Errorf("expected status %d, got %d", tt.wantStatus, rr.Code)
+			}
+
+			if called != (tt.wantStatus == http.StatusOK) {
+				t.Errorf("next handler called = %v, want %v",
+					called, tt.wantStatus == http.StatusOK)
+			}
+		})
+	}
+}

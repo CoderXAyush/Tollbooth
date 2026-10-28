@@ -109,3 +109,25 @@ func IdentityFromContext(ctx context.Context) (*Identity, bool) {
 	principal, ok := ctx.Value(contextKey{}).(*Identity)
 	return principal, ok
 }
+
+func AdminOnly(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		principal, ok := IdentityFromContext(r.Context())
+		if !ok || principal == nil {
+			http.Error(w, `{"error":{"code":"UNAUTHORIZED","message":"authentication required"}}`,
+				http.StatusUnauthorized)
+			return
+		}
+
+		if principal.Role != identity.RoleAdmin {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(
+				`{"error":{"code":"FORBIDDEN","message":"admin role required"}}`,
+			))
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}

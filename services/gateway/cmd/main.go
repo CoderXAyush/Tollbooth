@@ -131,8 +131,8 @@ func main() {
 	mux.HandleFunc("POST /api/auth/login", sessionHandler.Login)
 	mux.Handle("POST /api/auth/logout", sessionMiddleware(http.HandlerFunc(sessionHandler.Logout)))
 	mux.Handle("GET /api/me", sessionMiddleware(http.HandlerFunc(sessionHandler.Me)))
-	mux.Handle("/api/servers", sessionMiddleware(registryMux))
-	mux.Handle("/api/servers/", sessionMiddleware(registryMux))
+	mux.Handle("/api/servers", sessionMiddleware(auth.AdminOnly(registryMux)))
+	mux.Handle("/api/servers/", sessionMiddleware(auth.AdminOnly(registryMux)))
 
 	// External MCP API: temporary bootstrap token until Stage 4b API-key auth.
 	mux.Handle("/mcp", bootstrapMiddleware(mcpendpoint.NewHandler(upstreamMgr)))

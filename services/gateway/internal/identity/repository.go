@@ -36,7 +36,7 @@ func (r *Repository) CreateUser(ctx context.Context, email, password, role strin
 		return nil, errors.New("invalid role")
 	}
 
-	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), 12)
 	if err != nil {
 		return nil, fmt.Errorf("hash password: %w", err)
 	}
